@@ -1,4 +1,5 @@
 """
+Developed by Hikmet Can Çubukçu
 Biological‑Variation Calculator (Streamlit)
 ==========================================
 This single‑file Streamlit application helps a laboratory scientist calculate:
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field    # convenient result bundle
 import numpy as np                       # scientific number‑crunching
 import pandas as pd                      # tabular data handling
 import streamlit as st                   # web UI framework
-from scipy.stats import chi2             # chi‑square for exact CI of variance
+from scipy.stats import chi2 , t            # chi‑square for exact CI of variance
 from scipy.stats import shapiro, kstest, f              # normality + Cochran
 from scipy.stats import bartlett, linregress  
 import plotly.graph_objects as go   # ← NEW
@@ -296,22 +297,41 @@ def _preprocess_bv_dataframe(
             log.append(f"Total duplicate-pair exclusions (QI 8a): {len(out_pairs)}")
 
     # ════════════════════════════════════════════════════════════════════════
-    # 0 b.  Steady-state trend test (QI 7)
+    # 0 b.  Steady-state trend test (QI 7) – slope ± 95 % CI
     # ════════════════════════════════════════════════════════════════════════
+    tinv = lambda p, df: abs(t.ppf(p/2, df))   # two-sided Student-t quantile helper
+
     drift_subj = []
     for subj, g in df.groupby("Subject"):
-        if g["Sample"].nunique() > 2:                   # need ≥3 time-points
-            slp, _, _, pval, _ = linregress(g["Sample"], g["Result"])
-            if pval < 0.05:
-                drift_subj.append((subj, slp, pval))
+        if g["Sample"].nunique() <= 2:          # need ≥3 time-points
+            continue
 
-    for subj, slp, pval in drift_subj:
+        res = linregress(g["Sample"], g["Result"])
+        df_denom = len(g) - 2                   # regression degrees-of-freedom
+        if df_denom <= 0:
+            continue
+
+        ts = tinv(0.05, df_denom)               # 95 % two-sided critical t
+        ci_low  = res.slope - ts * res.stderr
+        ci_high = res.slope + ts * res.stderr
+
+        if res.pvalue < 0.05:                   # significant drift ⇒ mark for removal
+            drift_subj.append(dict(subj=subj,
+                                slope=res.slope,
+                                p=res.pvalue,
+                                ci=(ci_low, ci_high)))
+
+    # ── log + drop drifting subjects ─────────────────────────────────────────
+    for d in drift_subj:
         log.append(
-            f"QI 7 – temporal drift: Subject {subj} has significant trend "
-            f"(slope = {slp:+.3g}, p = {pval:.3g}) – excluded."
+            "QI 7 – temporal drift: Subject {subj} slope = {s:+.3g} "
+            "(95 % CI {lo:.3g}–{hi:.3g}, p = {p:.3g}) – excluded."
+            .format(subj=d["subj"], s=d["slope"], lo=d["ci"][0],
+                    hi=d["ci"][1], p=d["p"])
         )
+
     if drift_subj:
-        df = df[~df["Subject"].isin([s for s, *_ in drift_subj])]
+        df = df[~df["Subject"].isin([d["subj"] for d in drift_subj])]
         log.append(f"Total subjects excluded for drift (QI 7): {len(drift_subj)}")
 
     # ════════════════════════════════════════════════════════════════════════
