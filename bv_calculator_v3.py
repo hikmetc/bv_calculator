@@ -1,5 +1,5 @@
 """
-Developed by Hikmet Can Çubukçu
+Deveoped by Hikmet Can Çubukçu
 Biological‑Variation Calculator (Streamlit)
 ==========================================
 This single‑file Streamlit application helps a laboratory scientist calculate:
@@ -871,13 +871,15 @@ if user_df is not None:
 
                 # Key metrics — big bold labels, smaller numbers
                 st.subheader("Key metrics")
-                cols = st.columns(4, gap="large")
                 metrics = [
-                    ("CV<sub>A</sub>",  f"{res.cv_A:.2f} %",                None),
+                    ("Mean",            f"{res.grand_mean:.2f}",                                   None),
+                    ("CV<sub>A</sub>",  f"{res.cv_A:.2f} %",                                       None),
                     ("CV<sub>I</sub>",  f"{res.cv_I:.2f} %",  f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}% CI"),
                     ("CV<sub>G</sub>",  f"{res.cv_G:.2f} %",  f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}% CI"),
-                    ("95 % RCV",        f"±{res.rcv_95:.2f} %",             None),
+                    ("95 % RCV",        f"±{res.rcv_95:.2f} %",                                    None),
                 ]
+                # create exactly as many columns as we now have metrics
+                cols = st.columns(len(metrics), gap="large")
 
                 for col, (label, value, delta) in zip(cols, metrics):
                     with col:
@@ -887,26 +889,22 @@ if user_df is not None:
                             border-radius: 1rem;
                             padding: 0.8rem 1rem;
                             text-align: center;
-                            /* dual shadow for neumorphism */
                             box-shadow:
                             6px 6px 12px rgba(0, 0, 0, 0.12),
                             -6px -6px 12px rgba(255, 255, 255, 0.85);
                         ">
-                        <!-- Label -->
                         <div style="
                             font-size: 1.4rem;
                             font-weight: 800;
                             color: #1e3a5f;
                             margin-bottom: 0.25rem;
                         ">{label}</div>
-                        <!-- Value -->
                         <div style="
                             font-size: 1rem;
                             font-weight: 600;
                             color: #1b263b;
                             line-height: 1.2;
                         ">{value}</div>
-                        <!-- Delta/CI -->
                         {f"<div style='font-size:0.75rem; color:#5d6d7e; margin-top:0.3rem;'>{delta}</div>" if delta else ""}
                         </div>
                         """, unsafe_allow_html=True)
@@ -943,9 +941,6 @@ if user_df is not None:
                 st.plotly_chart(plot_subject_ranges(clean_df), use_container_width=True)
 
 
-
-
-
                 # ─────────────────────────────────────────────────────────────────────────────
                 #  📋  BIVAC CHECKLIST  (QI-6 → QI-13)
                 #      Grades:  A (best) → D (unreliable)
@@ -972,6 +967,7 @@ if user_df is not None:
                         "11": "Appropriate 2-level (nested) ANOVA model applied",
                         "12": "Exact 95 % confidence limits reported",
                         "13": "Transparency on number of results retained vs. excluded",
+                        "14": "Mean concentration reported",          
                     }
 
                     # ── helper: make one blank† row  ────────────────────────────────────────
@@ -997,6 +993,7 @@ if user_df is not None:
                         f"Samples/subject = {res.S} • "
                         f"Replicates/sample = {res.R}  →  N = {res.I*res.S*res.R}"
                     )
+                    rows["14"]["Details"] = f"Mean = {res.grand_mean:.2f}"
 
                     # ── scan the verbose log to adjust grades / add notes ──────────────────
                     for raw in log_lines:
@@ -1035,18 +1032,19 @@ if user_df is not None:
 
                     # ── turn into tidy DataFrame – order by QI number, A→D categorical grade
                     df = (pd.DataFrame(rows.values())
-                            .assign(Grade=lambda d: pd.Categorical(d["Grade"],
-                                                                categories=list("ABCD"),
-                                                                ordered=True))
-                            .sort_values("QI")
-                            .reset_index(drop=True))
+                            # NEW: extract the number (6-14) and sort on it numerically
+                            .assign(_num=lambda d: d["QI"].str.extract(r"(\d+)").astype(int))
+                            .assign(Grade=lambda d: pd.Categorical(
+                                d["Grade"], categories=list("ABCD"), ordered=True))
+                            .sort_values("_num")        # ensures 6 < 7 < … < 14
+                            .drop(columns="_num")       # housekeeping column no longer needed
+                            .reset_index(drop=True)
+                    )
                     return df
 
 
-
-
                 # ── render the checklist & XLSX download ────────────────────────────────────
-                st.subheader("BIVAC Checklist (QI 6 → QI 13)")
+                st.subheader("BIVAC Checklist (QI 6 → QI 14)")
                 bivac_df = _build_qi_checklist(res.preprocess_log, res)
 
                 st.dataframe(
@@ -1077,9 +1075,6 @@ if user_df is not None:
                             "spreadsheetml.sheet"
                         ),
                     )
-
-
-
 
 
                 # — Outlier / normality audit trail —
