@@ -1,5 +1,5 @@
 """
-Deveoped by Hikmet Can Çubukçu
+Deveoped by Hikmet Can Çubukçu 
 Biological‑Variation Calculator (Streamlit)
 ==========================================
 This single‑file Streamlit application helps a laboratory scientist calculate:
