@@ -369,45 +369,64 @@ def _preprocess_bv_dataframe(
     # ════════════════════════════════════════════════════════════════════════
     # 2.  Normality assessment  (subject-level + subject-means)
     # ════════════════════════════════════════════════════════════════════════
-    def _fraction_subjects_normal(d: pd.DataFrame) -> float:
-        n = d["Subject"].nunique()
-        if n < 3:            # too few subjects – force log-transform attempt
-            return 0.0
-        good = sum(
-            shapiro(g["Result"])[1] > normal_p
-            for _, g in d.groupby("Subject")
-            if g["Result"].size >= 3
+    # ════════════════════════════════════════════════════════════════════════
+    # 2.  Normality assessment  (subject-level  +  subject-means)   ⟨QI 9⟩
+    # ════════════════════════════════════════════════════════════════════════
+    def _fraction_subjects_normal(d: pd.DataFrame) -> tuple[int, int]:
+        """
+        Return (n_gaussian, n_eligible) where “eligible” means ≥3 results/subject.
+        Gaussianity is Shapiro-Wilk p-value > normal_p on raw results.
+        """
+        good, total = 0, 0
+        for _, g in d.groupby("Subject"):
+            if g["Result"].size >= 3:
+                total += 1
+                if shapiro(g["Result"])[1] > normal_p:
+                    good += 1
+        return good, total
+
+    # ── 2-a. Shapiro-Wilk on each subject (raw scale) ───────────────────────
+    n_good, n_total = _fraction_subjects_normal(df)
+    if n_total:
+        frac_txt = f"{n_good}/{n_total} subjects ({n_good/n_total:.0%})"
+        log.append(
+            f"Normality check (QI 9) – {frac_txt} passed Shapiro-Wilk "
+            f"p>{normal_p} on raw results."
         )
-        return good / n
+    else:
+        log.append("Normality check (QI 9) – skipped (too few subjects).")
 
     transformed = False
-    if _fraction_subjects_normal(df) <= 0.5:
+    if n_total and n_good / n_total <= 0.50:
         df["Result"] = np.log(df["Result"])
         transformed  = True
-        log.append("Natural-log transform applied – fewer than 50 % of subjects "
-                   "passed Shapiro-Wilk on raw data.")
+        log.append("Natural-log transform applied – <50 % of subjects were Gaussian.")
 
-    # ── subject-mean normality
+    # ── 2-b. Shapiro-Wilk & KS on subject means (always if ≥3 subjects) ─────
     means = df.groupby("Subject")["Result"].mean()
     if means.size >= 3:
         p_sw = shapiro(means)[1]
+        log.append(f"Subject-means SW p = {p_sw:.3g}.")
         if p_sw <= normal_p:
-            z      = (means - means.mean()) / means.std(ddof=0)
-            p_ks   = kstest(z, "norm")[1]
+            z_scores = (means - means.mean()) / means.std(ddof=0)
+            p_ks     = kstest(z_scores, "norm")[1]
+            log.append(f"   KS test on z-scores p = {p_ks:.3g}.")
             if p_ks <= normal_p and not transformed:
                 df["Result"] = np.log(df["Result"])
                 transformed  = True
-                log.append("Natural-log transform applied after subject-mean "
-                           "normality failure.")
+                log.append("Natural-log transform applied after subject-mean failure.")
                 means = df.groupby("Subject")["Result"].mean()
-                if means.size >= 3 and shapiro(means)[1] <= normal_p:
+                if shapiro(means)[1] <= normal_p:
                     raise ValueError("Normality could not be achieved – stopping.")
             elif p_ks <= normal_p:
-                raise ValueError("Normality could not be achieved even after "
-                                 "log-transform.")
+                raise ValueError("Normality could not be achieved even after log-transform.")
     else:
-        log.append("Subject-mean normality step skipped – fewer than three "
-                   "subjects remained.")
+        log.append("Subject-mean normality step skipped – fewer than three subjects.")
+
+    # ── final verdict for QI 9 ───────────────────────────────────────────────
+    scale = "log-scale" if transformed else "raw-scale"
+    log.append(f"✅ QI 9 satisfied – final data set Gaussian on {scale}.")
+
 
     # ════════════════════════════════════════════════════════════════════════
     # 3.  Variance-homogeneity across subjects (Bartlett, QI 10)
@@ -614,6 +633,12 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05) -> BVResult:
 
     # 3.11 reference‑change value (two‑sided, 95 %)
     rcv = 1.96 * np.sqrt(2) * np.sqrt(cv_A**2 + cv_I**2)
+    
+    # ⟨QI-6⟩ analytical imprecision – put a note into the audit trail
+    pp_log.append(
+        f"QI 6 – analytical imprecision calculated: CVₐ = {cv_A:.2f} % "
+        f"(based on R = {R} replicate(s)/sample)."
+    )
 
     # bundle everything and return
     return BVResult(
@@ -994,10 +1019,22 @@ if user_df is not None:
                         f"Replicates/sample = {res.R}  →  N = {res.I*res.S*res.R}"
                     )
                     rows["14"]["Details"] = f"Mean = {res.grand_mean:.2f}"
-
+                    rows["11"]["Details"] = (
+                        f"Balanced two-level nested ANOVA (Røraas 2012) "
+                        f"with I = {res.I}, S = {res.S}, R = {res.R}"
+                    )
                     # ── scan the verbose log to adjust grades / add notes ──────────────────
                     for raw in log_lines:
                         l = raw.lower()
+                        # QI-6  (analytical imprecision)  ← NEW
+                        if "qi 6 – analytical" in l:
+                            rows["6"]["Details"] += " · " + raw
+
+                        # downgrade QI-6 if no duplicates / replicates
+                        if "qi 6 – analytical imprecision" in l:
+                            if res.R < 2:
+                                rows["6"]["Grade"]   = "C"
+                                rows["6"]["Comment"] = "Single measurements – CVₐ not demonstrable"
 
                         # QI-7  (steady-state)
                         if "temporal drift" in l:
@@ -1011,13 +1048,15 @@ if user_df is not None:
                             rows["8"]["Details"] += (" · " + raw)
 
                         # QI-9  (normality)
-                        if "log transform applied" in l:
-                            rows["9"]["Comment"] = "Log-transform applied (allowed by BIVAC)"
-                            rows["9"]["Details"] += (" · " + raw)
-                        if "normality could not be achieved" in l:
-                            rows["9"]["Grade"]   = "D"
-                            rows["9"]["Comment"] = "Gaussian assumption ultimately failed"
-                            rows["9"]["Details"] += (" · " + raw)
+                        if "normality check (qi 9)" in l or "subject-means sw p" in l:
+                            rows["9"]["Details"] += " · " + raw
+
+                        if "✅ qi 9 satisfied" in l:
+                            rows["9"]["Details"] += " · Gaussian assumption met"
+
+                        # optional – flag that success relied on a log-transform
+                        if "log transform applied" in l and rows["9"]["Grade"] == "A":
+                            rows["9"]["Comment"] = "Accepted after log-transform"
 
                         # QI-10  (variance homogeneity)
                         if "bartlett test" in l:
