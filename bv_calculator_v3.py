@@ -539,12 +539,25 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05) -> BVResult:
         # fail fast if critical columns missing
         raise KeyError(f"Missing required columns: {required - set(df.columns)}")
     
+    # ── NEW – capture raw study dimensions BEFORE any cleaning ───────────────
+    I0 = df["Subject"].nunique()
+    S0 = df.groupby("Subject")["Sample"].nunique().mode().iat[0]
+    R0 = df.groupby(["Subject", "Sample"])["Replicate"].nunique().mode().iat[0]
+    # -------------------------------------------------------------------------
     # 3.1  apply Braga–Panteghini outlier/normality pipeline  
     try:
         df, pp_log = _preprocess_bv_dataframe(df, alpha=alpha)
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
         raise PreprocessError(str(e), e.log) from None
+
+    # ── NEW – prepend the headline to the audit trail ────────────────────────
+    pp_log.insert(
+        0,
+        f"Uploaded data: {I0} subjects × {S0} samples × {R0} replicates "
+        "(raw, before quality checks)."
+    )
+    # ------------------------------------------------------------------------
 
     # 3.2 derive counts (I, S, R) and assert balance
     I = df["Subject"].nunique()                                          # how many people
