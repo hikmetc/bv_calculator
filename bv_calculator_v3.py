@@ -186,6 +186,10 @@ class BVResult:
 
     # NEW – verbose audit trail of what happened during cleaning
     preprocess_log: list[str] = field(default_factory=list)
+    
+    # NEW – optional CV-ANOVA estimates
+    cv_I_cv_anova: float | None = None
+    ci_cv_I_cv_anova: tuple[float, float] | None = None
 
 
 # ——————————————————————————————————————————————————————————————
@@ -513,13 +517,57 @@ def _preprocess_bv_dataframe(
 
 
 
+# CV ANOVA function
+def _cvi_cv_anova(clean_df: pd.DataFrame, alpha: float = 0.05
+) -> tuple[float, tuple[float, float]]:
+    """
+    CV-ANOVA as recommended by Røraas et al., 2016
+    (see Clin Chem 62:725-736) :contentReference[oaicite:3]{index=3}
+    -----------------------------------------------------------------
+    1.  Divide every result by its subject-specific mean  →  CV-scale
+    2.  Perform the usual two-level balanced ANOVA on the *normalised*
+        values (mean ≈ 1).
+    3.  σ²_WP (within-person) on that scale √→ CVI (%).
+    4.  Exact CI via Burdick & Graybill χ² method (same df as classic).
+    """
+    df = clean_df.copy()
+    df["Norm"] = df["Result"] / df.groupby("Subject")["Result"].transform("mean")
+
+    I = df["Subject"].nunique()
+    S = df.groupby("Subject")["Sample"].nunique().iloc[0]
+    R = df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0]
+
+    subj_mean = df.groupby("Subject")["Norm"].mean()                     # ~1
+    samp_mean = df.groupby(["Subject", "Sample"])["Norm"].mean()
+
+    ms_wp = R * ((samp_mean - subj_mean.loc[samp_mean.index.get_level_values(0)].values) ** 2
+                 ).sum() / (I * (S - 1))
+    ms_a  = ((df["Norm"] - samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values) ** 2
+             ).sum() / (I * S * (R - 1))
+
+    var_wp = max((ms_wp - ms_a) / R, 0.0)                # σ²_WP on CV scale
+    cvi    = np.sqrt(var_wp) * 100                       # mean = 1 → CVI %
+
+    # -------- exact 95 % CI (same df as classic) ------------------
+    df_wp  = I * (S - 1)
+    chi_lo = chi2.ppf(alpha/2,     df_wp)
+    chi_hi = chi2.ppf(1 - alpha/2, df_wp)
+
+    ms_lo  = (df_wp * ms_wp) / chi_hi
+    ms_hi  = (df_wp * ms_wp) / chi_lo
+
+    ci_var_lo = max((ms_lo - ms_a) / R, 0.0)
+    ci_var_hi = max((ms_hi - ms_a) / R, 0.0)
+    ci        = (np.sqrt(ci_var_lo) * 100, np.sqrt(ci_var_hi) * 100)
+    return cvi, ci
 
 
 # ——————————————————————————————————————————————————————————————
 # 4.  Core calculation routine (closed‑form Røraas algebra)
 # ——————————————————————————————————————————————————————————————
 
-def calculate_bv(df: pd.DataFrame, alpha: float = 0.05) -> BVResult:
+def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
+                 use_cv_anova: bool = False) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
     Parameters
@@ -653,14 +701,23 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05) -> BVResult:
         f"(based on R = {R} replicate(s)/sample)."
     )
 
-    # bundle everything and return
+    # --- after the classic CV calculations are finished -----------------
+    cv_anova = ci_cv_anova = None
+    if use_cv_anova:
+        cv_anova, ci_cv_anova = _cvi_cv_anova(df, alpha)
+        pp_log.append(
+            f"CVI (CV-ANOVA) calculated: {cv_anova:.2f} % "
+            f"(95 % CI {ci_cv_anova[0]:.2f}–{ci_cv_anova[1]:.2f} %)."
+        )
+
     return BVResult(
         I, S, R, grand,
         var_A, var_WP, var_BP,
         cv_A, cv_I, cv_G,
-        ci_cv_I, ci_cv_G,    # now passing both intervals
-        rcv,
+        ci_cv_I, ci_cv_G, rcv,
         preprocess_log=pp_log,
+        cv_I_cv_anova=cv_anova,
+        ci_cv_I_cv_anova=ci_cv_anova,
     )
 
 
@@ -894,7 +951,9 @@ if user_df is not None:
             )
             st.success("Mapping saved – you can now calculate.")
 
-
+    # NEW – user option: CV-ANOVA
+    estimate_cv_anova = st.checkbox("Estimate CVI with CV-ANOVA")
+    st.session_state["use_cv_anova"] = estimate_cv_anova
 
     if st.button("Calculate", type="primary"):
         try:
@@ -904,51 +963,74 @@ if user_df is not None:
                 st.stop()                       # abort this run cleanly
 
             try:
-                res = calculate_bv(df_for_calc)
+                res = calculate_bv(
+                    df_for_calc,
+                    use_cv_anova=st.session_state.get("use_cv_anova", False)
+                )
 
 
                 # Key metrics — big bold labels, smaller numbers
+                #  Key metrics – two-row layout
+                # ────────────────────────────────────────────────────────────
                 st.subheader("Key metrics")
+
+                # --- build the metrics list ---
                 metrics = [
                     ("Mean",            f"{res.grand_mean:.2f}",                                   None),
                     ("CV<sub>A</sub>",  f"{res.cv_A:.2f} %",                                       None),
-                    ("CV<sub>I</sub>",  f"{res.cv_I:.2f} %",  f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}% CI"),
-                    ("CV<sub>G</sub>",  f"{res.cv_G:.2f} %",  f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}% CI"),
+                    ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span>",
+                        f"{res.cv_I:.2f} %",
+                        f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}% CI"),
+                    ("CV<sub>G</sub>",  f"{res.cv_G:.2f} %",
+                        f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}% CI"),
                     ("95 % RCV",        f"±{res.rcv_95:.2f} %",                                    None),
                 ]
-                # create exactly as many columns as we now have metrics
-                cols = st.columns(len(metrics), gap="large")
 
-                for col, (label, value, delta) in zip(cols, metrics):
-                    with col:
-                        st.markdown(f"""
-                        <div style="
-                            background: #f0f0f3;
-                            border-radius: 1rem;
-                            padding: 0.8rem 1rem;
-                            text-align: center;
-                            box-shadow:
-                            6px 6px 12px rgba(0, 0, 0, 0.12),
-                            -6px -6px 12px rgba(255, 255, 255, 0.85);
-                        ">
-                        <div style="
-                            font-size: 1.4rem;
-                            font-weight: 800;
-                            color: #1e3a5f;
-                            margin-bottom: 0.25rem;
-                        ">{label}</div>
-                        <div style="
-                            font-size: 1rem;
-                            font-weight: 600;
-                            color: #1b263b;
-                            line-height: 1.2;
-                        ">{value}</div>
-                        {f"<div style='font-size:0.75rem; color:#5d6d7e; margin-top:0.3rem;'>{delta}</div>" if delta else ""}
-                        </div>
-                        """, unsafe_allow_html=True)
+                # append the optional CV-ANOVA metric as *last* element
+                if res.cv_I_cv_anova is not None:
+                    metrics.append((
+                        "CV<sub>I</sub> <span style='font-size:0.75em;'>(based on CV-ANOVA)</span>",
+                        f"{res.cv_I_cv_anova:.2f} %",
+                        f"{res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f}% CI"
+                    ))
+
+                # --- split into rows ------------------------------------------------------
+                first_row  = metrics[:-3]                     # everything except the very last
+                second_row = metrics[-3:]                    # the last metric (may be empty)
+
+                # helper that renders one row of “cards”
+                def _render_row(row_metrics):
+                    cols = st.columns(len(row_metrics), gap="large")
+                    for col, (label, value, delta) in zip(cols, row_metrics):
+                        with col:
+                            st.markdown(f"""
+                            <div style="
+                                background:#f0f0f3; border-radius:1rem; padding:0.8rem 1rem;
+                                text-align:center;
+                                box-shadow:6px 6px 12px rgba(0,0,0,0.12),
+                                        -6px -6px 12px rgba(255,255,255,0.85);
+                            ">
+                            <div style="font-size:1.4rem; font-weight:800; color:#1e3a5f;
+                                        line-height:1.1; margin-bottom:0.15rem;">
+                                {label}
+                            </div>
+                            <div style="font-size:1rem; font-weight:600; color:#1b263b;
+                                        line-height:1.2;">{value}</div>
+                            {f"<div style='font-size:0.75rem; color:#5d6d7e; margin-top:0.3rem;'>{delta}</div>" if delta else ""}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                # draw the two rows
+                _render_row(first_row)
+                if second_row:                               
+                    st.write(" ")
+                    st.write(" ")
+                    _render_row(second_row)
 
 
                 # Summary table of CVs and 95% CIs
+                st.write(" ")
+                st.write(" ")
                 st.subheader("Summary of variation metrics")
                 var_tbl = pd.DataFrame({
                     "Component": ["Analytical", "Within-subject", "Between-subject"],
@@ -1025,6 +1107,11 @@ if user_df is not None:
                     rows["12"]["Details"] = (
                         f"CVᵢ 95 % CI {res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f} %; "
                         f"CVg 95 % CI {res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f} %"
+                    )
+                    rows["12"]["Details"] += (
+                        f"; CVᵢ (CV-ANOVA) 95 % CI "
+                        f"{res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f} %"
+                        if res.cv_I_cv_anova is not None else ""
                     )
                     rows["13"]["Details"] = (
                         f"Subjects = {res.I} • "
