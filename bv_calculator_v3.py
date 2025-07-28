@@ -179,6 +179,9 @@ class BVResult:
     cv_I: float
     cv_G: float
 
+    ci_mean:  tuple[float, float]       # 95 % CI on grand mean
+    ci_cv_A:  tuple[float, float]       # 95 % CI on CV_A
+
     # confidence intervals & RCV
     ci_cv_I: tuple[float, float]  # (lower, upper) on CV_I
     ci_cv_G: tuple[float, float]  # (lower, upper) on CV_G   ← new
@@ -210,12 +213,50 @@ def _default_idx(role: str, cols: list[str]) -> int:
             return i
     return 0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: remove any index column accidentally read as data
+# ─────────────────────────────────────────────────────────────────────────────
+def _strip_ghost_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If the left‑most column is unnamed ('' or starts with 'Unnamed'),
+    drop it and return the cleaned DataFrame.
+    """
+    if not df.empty and (df.columns[0] == "" or df.columns[0].startswith("Unnamed")):
+        return df.iloc[:, 1:]
+    return df
 
 # ——————————————————————————————————————————————————————————————
 # 3-bis.  Braga–Panteghini flow-chart utilities
 #        (outlier tests + distribution checks)  :contentReference[oaicite:0]{index=0}
 # ——————————————————————————————————————————————————————————————
+
+from collections import namedtuple
+CochranResult = namedtuple("CochranResult", "flag G G_crit")
+
 def _cochrans_test(variances: np.ndarray,
+                   alpha: float = 0.05,
+                   df: int = 1) -> CochranResult:
+    """
+    Perform Cochran’s C test and *return both* the decision and
+    the two key statistics so the caller can log them.
+
+    Returns
+    -------
+    CochranResult(flag, G, G_crit)
+        flag : True  → largest variance is an outlier
+               False → no outlier
+    """
+    k = variances.size
+    if k < 2:
+        return CochranResult(False, np.nan, np.nan)
+
+    G = variances.max() / variances.sum()
+    q = 1 - alpha / k                       # Šidák
+    f_crit = f.ppf(q, 1, (k - 1) * df)
+    G_crit = f_crit / (f_crit + (k - 1))
+    return CochranResult(G > G_crit, G, G_crit)
+
+def _cochrans_test2(variances: np.ndarray,
                    alpha: float = 0.05,
                    df: int = 1) -> bool:
     """
@@ -260,8 +301,11 @@ def _reed_outlier(values: np.ndarray) -> int | None:
 # ──────────────────────────────────────────────────────────────────────────────
 def _preprocess_bv_dataframe(
         df_in: pd.DataFrame,
+        *,
         alpha: float = 0.05,
-        normal_p: float = 0.05
+        normal_p: float = 0.05,
+        enforce_balance: bool = True,
+        flags: dict[str, bool] | None = None,          #  NEW
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
@@ -270,178 +314,348 @@ def _preprocess_bv_dataframe(
     """
     log: list[str] = []
     df = df_in.copy()
+    transformed = False
+
+    flags = flags or {}                    # safety – empty dict if None
+    ON     = lambda name: flags.get(name, True)   # helper: is this step enabled?
 
     # ════════════════════════════════════════════════════════════════════════
-    # 0.  Duplicate-pair consistency (QI 8a)
+    # 0.  Replicate‑set consistency  (QI 8a – Cochran variance test)
+    #     • For every Subject‑×‑Sample pair we calculate the variance of its
+    #       replicate measurements.
+    #     • Cochran’s C identifies the pair whose variance is disproportionately
+    #       large.  We iteratively remove offenders until the test is passed.
     # ════════════════════════════════════════════════════════════════════════
-    if df["Replicate"].nunique() == 2:                  # only meaningful for duplicates
-        piv   = (df.pivot_table(index=["Subject", "Sample"],
-                                columns="Replicate",
-                                values="Result")
-                   .dropna())                           # drop incomplete pairs
-        delta = (piv[1] - piv[2]).abs()
-        thr   = delta.mean() + 3 * delta.std(ddof=0)
-        out_pairs = delta[delta > thr].index            # MultiIndex (Subject, Sample)
 
-        for subj, samp in out_pairs:
-            r_values = (piv.loc[(subj, samp)]
-                           .sort_index()                # replicate 1 first
-                           .to_dict())
+    # ── QI 8a – replicate–set Cochran ──────────────────────────────────────────
+    if ON("rep_cochran"):
+        while True:
+            rep_var = (df.groupby(["Subject", "Sample"])["Result"]
+                        .var(ddof=1).dropna())
+            if rep_var.size < 3:
+                break
+
+            R = (df.groupby(["Subject", "Sample"])["Replicate"]
+                .nunique().mode().iat[0])          # current modal replicate count
+
+            c_res = _cochrans_test(rep_var.values, alpha, df=R - 1)
+            # ── NEW universal log line ──────────────────────────
             log.append(
-                f"QI 8a – duplicate-pair outlier removed → "
+                f"QI 8a – Cochran (replicate sets): "
+                f"G = {c_res.G:.3f}, Gcrit = {c_res.G_crit:.3f}"
+                + (" → OUTLIER" if c_res.flag else " → no outlier detected")
+            )
+
+            if not c_res.flag:          # test passed → exit the loop
+                break
+
+            log.append(
+                f"QI 8a – Cochran test: G = {c_res.G:.3f}, "
+                f"Gcrit = {c_res.G_crit:.3f}"
+            )
+
+            subj, samp = rep_var.idxmax()
+            vals = df.loc[(df["Subject"] == subj) & (df["Sample"] == samp), "Result"]
+            log.append(
+                f"QI 8a – replicate Cochran outlier removed → "
                 f"Subject {subj}, Sample {samp}: "
-                + ", ".join(f"R{int(r)} = {v:.2f}" for r, v in r_values.items())
-                + f"  (|Δ| = {abs(r_values[1]-r_values[2]):.2f} > {thr:.2f})"
+                + ", ".join(f"{v:.2f}" for v in vals) +
+                f"  (s² = {rep_var.max():.4f})"
             )
+            df = df[~((df["Subject"] == subj) & (df["Sample"] == samp))]
+    else:
+        log.append("Replicate Cochran (QI 8a) skipped (switch off).")
 
-        # actually drop every offending pair
-        if len(out_pairs):
-            mask = df.set_index(["Subject", "Sample"]).index.isin(out_pairs)
-            df   = df[~mask]
-            log.append(f"Total duplicate-pair exclusions (QI 8a): {len(out_pairs)}")
+    # ─────────────────────────────────────────────────────────────────────────
+    # ❋ NEW: Bartlett's homogeneity test – analytic variance (replicates)
+    # Purpose: Are the replicate variances per Subject×Sample similar? 
+    # (Is the analytic imprecison homogeneous across all samples?)
+    # ─────────────────────────────────────────────────────────────────────────
+    if ON("rep_bartlett"):
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 0 b.  Steady-state trend test (QI 7) – slope ± 95 % CI
-    # ════════════════════════════════════════════════════════════════════════
-    tinv = lambda p, df: abs(t.ppf(p/2, df))   # two-sided Student-t quantile helper
+        valid_groups = []
+        group_keys    = []                        # (Subject, Sample) anahtarlarını da tut
+        for (subj, samp), g in df.groupby(["Subject", "Sample"]):
+            if g["Result"].size < 2:              # Bartlett için ≥2 ölçüm şart
+                continue
+            if g["Result"].var(ddof=1) == 0:      # Excel: s² = 0 olan çiftleri hariç tutar
+                continue
+            valid_groups.append(g["Result"].values)
+            group_keys.append((subj, samp))
 
-    drift_subj = []
-    for subj, g in df.groupby("Subject"):
-        if g["Sample"].nunique() <= 2:          # need ≥3 time-points
-            continue
+        if len(valid_groups) >= 3:                # Bartlett ≥3 grup ister
+            with np.errstate(all="ignore"):       # sabit giriş uyarılarını bastır
+                bart_stat, bart_p = bartlett(*valid_groups)
+            rep_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
+            k = len(valid_groups)
+            chi_crit = chi2.ppf(1 - alpha, k - 1)
 
-        res = linregress(g["Sample"], g["Result"])
-        df_denom = len(g) - 2                   # regression degrees-of-freedom
-        if df_denom <= 0:
-            continue
-
-        ts = tinv(0.05, df_denom)               # 95 % two-sided critical t
-        ci_low  = res.slope - ts * res.stderr
-        ci_high = res.slope + ts * res.stderr
-
-        if res.pvalue < 0.05:                   # significant drift ⇒ mark for removal
-            drift_subj.append(dict(subj=subj,
-                                slope=res.slope,
-                                p=res.pvalue,
-                                ci=(ci_low, ci_high)))
-
-    # ── log + drop drifting subjects ─────────────────────────────────────────
-    for d in drift_subj:
-        log.append(
-            "QI 7 – temporal drift: Subject {subj} slope = {s:+.3g} "
-            "(95 % CI {lo:.3g}–{hi:.3g}, p = {p:.3g}) – excluded."
-            .format(subj=d["subj"], s=d["slope"], lo=d["ci"][0],
-                    hi=d["ci"][1], p=d["p"])
-        )
-
-    if drift_subj:
-        df = df[~df["Subject"].isin([d["subj"] for d in drift_subj])]
-        log.append(f"Total subjects excluded for drift (QI 7): {len(drift_subj)}")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # 1.  Iterative outlier removal (Cochran then Reed)
-    # ════════════════════════════════════════════════════════════════════════
-    while True:
-        # ── 1-a. Cochran variance test (within-subject)
-        subj_var = df.groupby("Subject")["Result"].var(ddof=1).dropna()
-        if subj_var.size >= 2 and _cochrans_test(subj_var.values, alpha):
-            culprit = subj_var.idxmax()
-            vals    = df.loc[df["Subject"] == culprit, "Result"]
             log.append(
-                f"Cochran variance outlier → removed Subject {culprit} "
-                f"(σ²_wp = {subj_var.max():.3f}; values: "
-                + ", ".join(f"{v:.2f}" for v in vals) + ")"
+                f"QI 8a – Bartlett test (replicate sets): "
+                f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
+                f"p = {bart_p:.4f} → variances {rep_msg}."
             )
-            df = df[~df["Subject"].eq(culprit)]
-            continue
 
-        # ── 1-b. Reed mean test (between-subject)
-        subj_mean = df.groupby("Subject")["Result"].mean()
-        ridx = _reed_outlier(subj_mean.values)
-        if ridx is not None:
+            # Excel’de olduğu gibi: heterojen ise en yüksek 5 s²’yi raporla
+            if bart_p < alpha:
+                rep_var = (df.groupby(["Subject", "Sample"])["Result"]
+                            .var(ddof=1)
+                            .loc[group_keys])     # yalnızca teste giren çiftler
+                top_bad = rep_var.sort_values(ascending=False).head(5)
+                for (subj, samp), v in top_bad.items():
+                    log.append(
+                        f"  High analytical variance → "
+                        f"Subject {subj}, Sample {samp}  (s² = {v:.4f})"
+                    )
+        else:
+            log.append(
+                "QI 8a – Bartlett test (replicate sets) skipped: "
+                "fewer than 3 valid replicate groups."
+            )
+    else:
+        log.append("Replicate Bartlett (QI 8a) skipped (switch off).")
+
+    # ── QI 8b – sample‑level Cochran inside each subject ──────────────────
+    if ON("samp_cochran"):
+
+        changed = True
+        while changed:
+            changed = False
+            for subj, g in df.groupby("Subject"):
+
+                samp_var = g.groupby("Sample")["Result"].var(ddof=1).dropna()
+
+                # (3) ensure we log even when the test is impossible
+                if samp_var.size < 3:
+                    log.append(f"QI 8b – Cochran skipped (Subject {subj}): <3 variances.")
+                    continue
+
+                r_per_sample = g.groupby("Sample")["Replicate"].nunique().mode().iat[0]
+
+                # (2) Cochran undefined if only one replicate
+                if r_per_sample < 2:
+                    log.append(f"QI 8b – Cochran skipped (Subject {subj}): only 1 replicate.")
+                    continue
+
+                c_res = _cochrans_test(samp_var.values, alpha, df=r_per_sample - 1)
+
+                # single universal log line
+                log.append(
+                    f"QI 8b – Cochran (Subject {subj}): "
+                    f"G = {c_res.G:.3f}, Gcrit = {c_res.G_crit:.3f}"
+                    + (" → OUTLIER" if c_res.flag else " → no outlier detected")
+                )
+
+                if not c_res.flag:
+                    continue  # nothing to remove – next subject
+
+                # remove the offending sample
+                samp = samp_var.idxmax()
+                vals = df.loc[(df["Subject"] == subj) & (df["Sample"] == samp), "Result"]
+                log.append(
+                    f"QI 8b – sample Cochran outlier removed → "
+                    f"Subject {subj}, Sample {samp}: "
+                    + ", ".join(f"{v:.2f}" for v in vals) +
+                    f"  (s² = {samp_var.max():.4f})"
+                )
+                df = df[~((df["Subject"] == subj) & (df["Sample"] == samp))]
+                changed = True
+                break   # restart because groupby cache is stale
+    else:
+        log.append("Sample Cochran (QI 8b) skipped (switch off).")
+
+    # ── QI 8c – between‑subject Reed test only ────────────────────────────────
+    if ON("reed"):
+
+        removed_any = False          # ① NEW – keeps track of removals
+
+        while True:
+            subj_mean = df.groupby("Subject")["Result"].mean()
+            ridx      = _reed_outlier(subj_mean.values)
+
+            if ridx is None:
+                # no new outlier found → exit loop …
+                if not removed_any:  # ② NEW – log only if the very first check already passed
+                    log.append("QI 8c – Reed test passed: no between‑subject outliers.")
+                break
+
+            removed_any = True       # mark that we did remove something
+
             culprit = subj_mean.index[ridx]
             vals    = df.loc[df["Subject"] == culprit, "Result"]
+
             log.append(
-                f"Reed mean outlier → removed Subject {culprit} "
+                f"QI 8c – Reed mean outlier → removed Subject {culprit} "
                 f"(mean = {subj_mean.iloc[ridx]:.2f}; values: "
                 + ", ".join(f"{v:.2f}" for v in vals) + ")"
             )
             df = df[~df["Subject"].eq(culprit)]
-            continue
-        break  # nothing else to drop
+    else:
+        log.append("Reed between‑subject (QI 8c) skipped (switch off).")
 
     # ════════════════════════════════════════════════════════════════════════
-    # 2.  Normality assessment  (subject-level + subject-means)
+    # 0 b.  Steady‑state trend test (QI 7) – slope ± 95 % CI
     # ════════════════════════════════════════════════════════════════════════
+    if ON("drift"):
+
+        tinv = lambda p, df: abs(t.ppf(p/2, df))        # two‑sided t‑quantile
+        drift_records = []                               # list of dicts
+
+        for subj, g in df.groupby("Subject"):
+            # need at least three time‑points for a slope
+            if g["Sample"].nunique() <= 2:
+                continue
+
+            res = linregress(g["Sample"], g["Result"])
+            df_denom = len(g) - 2                       # regression d.f.
+            if df_denom <= 0:
+                continue
+
+            ts = tinv(0.05, df_denom)                   # 95 % two‑sided
+            ci_low  = res.slope - ts * res.stderr
+            ci_high = res.slope + ts * res.stderr
+
+            if res.pvalue < 0.05:                       # significant drift
+                drift_records.append(
+                    dict(subj=subj,
+                        slope=res.slope,
+                        p=res.pvalue,
+                        ci=(ci_low, ci_high))
+                )
+
+        # ── write log + drop drifting subjects *once* ───────────────────────
+        if drift_records:
+            for d in drift_records:
+                log.append(
+                    "QI 7 – temporal drift: Subject {subj} slope = {s:+.3g} "
+                    "(95 % CI {lo:.3g}–{hi:.3g}, p = {p:.3g}) – excluded."
+                    .format(subj=d["subj"], s=d["slope"],
+                            lo=d["ci"][0], hi=d["ci"][1], p=d["p"])
+                )
+
+            df = df[~df["Subject"].isin([d["subj"] for d in drift_records])]
+            log.append(f"Total subjects excluded for drift (QI 7): {len(drift_records)}")
+
+    else:
+        log.append("Steady‑state drift (QI 7) skipped (switch off).")
+
+
     # ════════════════════════════════════════════════════════════════════════
     # 2.  Normality assessment  (subject-level  +  subject-means)   ⟨QI 9⟩
     # ════════════════════════════════════════════════════════════════════════
-    def _fraction_subjects_normal(d: pd.DataFrame) -> tuple[int, int]:
-        """
-        Return (n_gaussian, n_eligible) where “eligible” means ≥3 results/subject.
-        Gaussianity is Shapiro-Wilk p-value > normal_p on raw results.
-        """
-        good, total = 0, 0
-        for _, g in d.groupby("Subject"):
-            if g["Result"].size >= 3:
-                total += 1
-                if shapiro(g["Result"])[1] > normal_p:
-                    good += 1
-        return good, total
+    if ON("normality"):
 
-    # ── 2-a. Shapiro-Wilk on each subject (raw scale) ───────────────────────
-    n_good, n_total = _fraction_subjects_normal(df)
-    if n_total:
-        frac_txt = f"{n_good}/{n_total} subjects ({n_good/n_total:.0%})"
-        log.append(
-            f"Normality check (QI 9) – {frac_txt} passed Shapiro-Wilk "
-            f"p>{normal_p} on raw results."
-        )
-    else:
-        log.append("Normality check (QI 9) – skipped (too few subjects).")
+        def _fraction_subjects_normal(d: pd.DataFrame) -> tuple[int, int]:
+            """
+            Return (n_gaussian, n_eligible) where “eligible” means ≥3 results/subject.
+            Gaussianity is Shapiro-Wilk p-value > normal_p on raw results.
+            """
+            good, total = 0, 0
+            for _, g in d.groupby("Subject"):
+                if g["Result"].size >= 3:
+                    total += 1
+                    if shapiro(g["Result"])[1] > normal_p:
+                        good += 1
+            return good, total
 
-    transformed = False
-    if n_total and n_good / n_total <= 0.50:
-        df["Result"] = np.log(df["Result"])
-        transformed  = True
-        log.append("Natural-log transform applied – <50 % of subjects were Gaussian.")
+        # ── 2-a. Shapiro-Wilk on each subject (raw scale) ───────────────────────
+        n_good, n_total = _fraction_subjects_normal(df)
+        if n_total:
+            frac_txt = f"{n_good}/{n_total} subjects ({n_good/n_total:.0%})"
+            log.append(
+                f"Normality check (QI 9) – {frac_txt} passed Shapiro-Wilk "
+                f"p>{normal_p} on raw results."
+            )
+        else:
+            log.append("Normality check (QI 9) – skipped (too few subjects).")
 
-    # ── 2-b. Shapiro-Wilk & KS on subject means (always if ≥3 subjects) ─────
-    means = df.groupby("Subject")["Result"].mean()
-    if means.size >= 3:
-        p_sw = shapiro(means)[1]
-        log.append(f"Subject-means SW p = {p_sw:.3g}.")
-        if p_sw <= normal_p:
-            z_scores = (means - means.mean()) / means.std(ddof=0)
-            p_ks     = kstest(z_scores, "norm")[1]
-            log.append(f"   KS test on z-scores p = {p_ks:.3g}.")
-            if p_ks <= normal_p and not transformed:
+        if n_total and n_good / n_total <= 0.50:
+            df["Result"] = np.log(df["Result"])
+            transformed  = True
+            log.append("Natural-log transform applied – <50 % of subjects were Gaussian.")
+
+        # ── 2‑b. Shapiro‑Wilk on subject means (always if ≥3 subjects) ──────────
+        means = df.groupby("Subject")["Result"].mean()
+        if means.size >= 3:
+            p_sw = shapiro(means)[1]
+            log.append(f"Subject‑means Shapiro-Wilk p = {p_sw:.3g}.")
+            
+            if p_sw <= normal_p and not transformed:
+                # one chance: log‑transform the whole dataset
                 df["Result"] = np.log(df["Result"])
                 transformed  = True
-                log.append("Natural-log transform applied after subject-mean failure.")
+                log.append("Natural‑log transform applied after subject‑mean SW failure.")
                 means = df.groupby("Subject")["Result"].mean()
                 if shapiro(means)[1] <= normal_p:
                     raise ValueError("Normality could not be achieved – stopping.")
-            elif p_ks <= normal_p:
-                raise ValueError("Normality could not be achieved even after log-transform.")
+            elif p_sw <= normal_p:
+                raise ValueError("Normality could not be achieved even after log‑transform.")
     else:
-        log.append("Subject-mean normality step skipped – fewer than three subjects.")
-
-    # ── final verdict for QI 9 ───────────────────────────────────────────────
-    scale = "log-scale" if transformed else "raw-scale"
-    log.append(f"✅ QI 9 satisfied – final data set Gaussian on {scale}.")
-
+        log.append("Normality checks / log‑transform (QI 9) skipped (switch off).")  
 
     # ════════════════════════════════════════════════════════════════════════
     # 3.  Variance-homogeneity across subjects (Bartlett, QI 10)
     # ════════════════════════════════════════════════════════════════════════
-    if df["Subject"].nunique() >= 2:
-        bart_p = bartlett(*[g["Result"].values for _, g in df.groupby("Subject")])[1]
-        msg    = ("heterogeneous" if bart_p < 0.05 else "homogeneous")
-        log.append(f"Bartlett test (QI 10): p = {bart_p:.3g} → variances {msg}.")
-    else:
-        log.append("Bartlett test skipped – fewer than two subjects remain.")
+#    if df["Subject"].nunique() >= 2:
+#        bart_p = bartlett(*[g["Result"].values for _, g in df.groupby("Subject")])[1]
+#        msg    = ("heterogeneous" if bart_p < 0.05 else "homogeneous")
+#        log.append(f"Bartlett test (QI 10): p = {bart_p:.3g} → variances {msg}.")
+#    else:
+#        log.append("Bartlett test skipped – fewer than two subjects remain.")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # 3.  Variance‑homogeneity *across subjects*  (Bartlett, QI 10 – Excel uyumlu)
+    #     Excel mantığı:
+    #       ① Her denekte (Subject) önce replicates ortalaması alınır →
+    #          her örnek (Sample) tek bir değere iner → analitik gürültü elenir.
+    #       ② Aynı deneğin ≥2 örneği varsa bunların varyansı s²_WP hesaplanır.
+    #       ③ Bartlett testi ≥3 deneklik {s²_WP} kümesine uygulanır.
+    # ════════════════════════════════════════════════════════════════════════
+    if ON("wp_bartlett"):
+
+        subj_groups = []          # Bartlett’e girecek her deneğin “örnek ortalamaları”
+        subj_keys   = []          # Aynı sırayla Subject ID tut (rapor log’u için)
+
+        for subj, g in df.groupby("Subject"):
+            if g["Sample"].nunique() < 2:      # Bartlett için denek başına ≥2 örnek gerek
+                continue
+            sample_means = g.groupby("Sample")["Result"].mean().values
+            if sample_means.var(ddof=1) == 0:  # Excel: varyans sıfırsa deneği test dışı bırakır
+                continue
+            subj_groups.append(sample_means)
+            subj_keys.append(subj)
+
+        if len(subj_groups) >= 3:              # Bartlett ≥3 grup ister
+            with np.errstate(all="ignore"):    # sabit grup uyarılarını bastır
+                bart_stat, bart_p = bartlett(*subj_groups)
+            wp_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
+            k = len(subj_groups)
+            chi_crit = chi2.ppf(1 - alpha, k - 1)
+
+            log.append(
+                f"QI 10 – Bartlett test (within‑subject variances): "
+                f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
+                f"p = {bart_p:.4f} → variances {wp_msg}."
+            )
+
+            # If p < alpha, report the top 5 highest within-subject variances (s²_WP)
+            if bart_p < alpha:
+                wp_var = {
+                    subj: g.groupby("Sample")["Result"].mean().var(ddof=1)
+                    for subj, g in df.groupby("Subject") if subj in subj_keys
+                }
+                for subj, v in sorted(wp_var.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    log.append(
+                        f"  High within‑subject variance → Subject {subj}  (s² = {v:.4f})"
+                    )
+        else:
+            log.append(
+                "QI 10 – Bartlett test (within‑subject variances) skipped: "
+                "fewer than 3 eligible subjects."
+            )
+    else:
+        log.append("Within‑subject Bartlett (QI 10) skipped (switch off).")  
+    
     # ════════════════════════════════════════════════════════════════════════
     # 4.  Force a perfectly balanced design for the ANOVA
     # ════════════════════════════════════════════════════════════════════════
@@ -449,63 +663,83 @@ def _preprocess_bv_dataframe(
     # 4.  Force a perfectly balanced design (equal S & R)
     #     – required for the closed-form two-level ANOVA that follows
     # ════════════════════════════════════════════════════════════════════════
+    # ═════════ 4.  Force a perfectly balanced design ══════════════════════
+    if enforce_balance:                                      # NEW GUARD
 
-    # 4-a ▸ SUBJECT-LEVEL balance  ───────────────────────────────────────────
-    samp_cnt  = df.groupby("Subject")["Sample"].nunique()          # how many samples per subject
-    target_S  = samp_cnt.mode().iat[0] if not samp_cnt.empty else 0
+        # 4-a ▸ SUBJECT-LEVEL balance  ───────────────────────────────────────────
+        samp_cnt  = df.groupby("Subject")["Sample"].nunique()          # how many samples per subject
+        target_S  = samp_cnt.mode().iat[0] if not samp_cnt.empty else 0
 
-    off_subj  = samp_cnt[samp_cnt != target_S]                     # subjects that deviate
-    if not off_subj.empty:
-        for subj, nS in off_subj.items():
+        off_subj  = samp_cnt[samp_cnt != target_S]                     # subjects that deviate
+        if not off_subj.empty:
+            for subj, nS in off_subj.items():
+                log.append(
+                    f"Balance check – Subject **{subj}** contributes "
+                    f"{nS}/{target_S} required samples; subject **excluded** to keep "
+                    "a fully crossed design."
+                )
             log.append(
-                f"Balance check – Subject **{subj}** contributes "
-                f"{nS}/{target_S} required samples; subject **excluded** to keep "
-                "a fully crossed design."
+                f"{len(off_subj)} subject(s) dropped because they lacked the modal "
+                f"sample count *S = {target_S}*."
             )
-        log.append(
-            f"{len(off_subj)} subject(s) dropped because they lacked the modal "
-            f"sample count *S = {target_S}*."
-        )
 
-    # retain only subjects with the correct sample count
-    df = df[df["Subject"].isin(samp_cnt[samp_cnt == target_S].index)]
+        # retain only subjects with the correct sample count
+        df = df[df["Subject"].isin(samp_cnt[samp_cnt == target_S].index)]
 
-    # 4-b ▸ SAMPLE-LEVEL balance  (replicate count)  ─────────────────────────
-    rep_cnt  = (df.groupby(["Subject", "Sample"])["Replicate"]
-                .nunique()
-                .reset_index(name="n"))
-    target_R = rep_cnt["n"].mode().iat[0] if not rep_cnt.empty else 0
+        # 4-b ▸ SAMPLE-LEVEL balance  (replicate count)  ─────────────────────────
+        rep_cnt  = (df.groupby(["Subject", "Sample"])["Replicate"]
+                    .nunique()
+                    .reset_index(name="n"))
+        target_R = rep_cnt["n"].mode().iat[0] if not rep_cnt.empty else 0
 
-    bad_pairs = rep_cnt[rep_cnt["n"] != target_R]
-    if not bad_pairs.empty:
-        for _, row in bad_pairs.iterrows():
+        bad_pairs = rep_cnt[rep_cnt["n"] != target_R]
+        if not bad_pairs.empty:
+            for _, row in bad_pairs.iterrows():
+                log.append(
+                    f"Balance check – Subject **{row.Subject}**, Sample **{row.Sample}** "
+                    f"has {row.n}/{target_R} replicate measurements; sample **removed**."
+                )
             log.append(
-                f"Balance check – Subject **{row.Subject}**, Sample **{row.Sample}** "
-                f"has {row.n}/{target_R} replicate measurements; sample **removed**."
+                f"{len(bad_pairs)} sample(s) discarded to enforce a uniform replicate "
+                f"count *R = {target_R}* across all remaining subjects."
             )
+
+        if not bad_pairs.empty:
+            bad_idx = df.set_index(["Subject", "Sample"]).index.isin(
+                bad_pairs.set_index(["Subject", "Sample"]).index)
+            df = df[~bad_idx]
+
+
+        # 4-c.  final sanity check
+        I_fin = df["Subject"].nunique()
+        if df.empty:
+            raise PreprocessError(
+                "All data were excluded by quality checks – nothing left to analyse.",
+                log,
+            )
+        S_fin = df.groupby("Subject")["Sample"].nunique().iloc[0]
+        R_fin = (df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0])
+
+        log.append(f"✅ Balanced data set ready: {I_fin} subjects × "
+                f"{S_fin} samples × {R_fin} replicates retained for ANOVA.")
+        
+    else:                                                    # NEW ─ skip pruning
+        log.append("⚠️ Balance enforcement skipped – continuing with "
+                   "unbalanced data; results will use the unbalanced formulas.")
+        # ─── NEW ▶ log the FINAL numbers kept for analysis ─────────────────
+        I_fin = df["Subject"].nunique()
+        S_fin = df.groupby("Subject")["Sample"].nunique().mean()          # mean S
+        R_fin = df.groupby(["Subject","Sample"])["Replicate"].nunique().mean()  # mean R
         log.append(
-            f"{len(bad_pairs)} sample(s) discarded to enforce a uniform replicate "
-            f"count *R = {target_R}* across all remaining subjects."
+            f"✅ Final data set (without enforcement for balanced crossed design): {I_fin} subjects, "
+            f"mean {S_fin:.2f} samples/subject, "
+            f"mean {R_fin:.2f} replicates/sample retained for ANOVA."
         )
+        # -------------------------------------------------------------------
 
-    if not bad_pairs.empty:
-        bad_idx = df.set_index(["Subject", "Sample"]).index.isin(
-            bad_pairs.set_index(["Subject", "Sample"]).index)
-        df = df[~bad_idx]
-
-
-    # 4-c.  final sanity check
-    I_fin = df["Subject"].nunique()
-    if df.empty:
-        raise PreprocessError(
-            "All data were excluded by quality checks – nothing left to analyse.",
-            log,
-        )
-    S_fin = df.groupby("Subject")["Sample"].nunique().iloc[0]
-    R_fin = (df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0])
-
-    log.append(f"✅ Balanced data set ready: {I_fin} subjects × "
-               f"{S_fin} samples × {R_fin} replicates retained for ANOVA.")
+        # minimal sanity check
+        if df.empty:
+            raise PreprocessError("All data removed during QC.", log)
 
     # ════════════════════════════════════════════════════════════════════════
     # 5.  Return cleaned data (back-transformed if needed) + log
@@ -562,12 +796,134 @@ def _cvi_cv_anova(clean_df: pd.DataFrame, alpha: float = 0.05
     return cvi, ci
 
 
+# ---------------------------------------------------------------------------
+#  CV‑ANOVA  →  unbalanced design
+# ---------------------------------------------------------------------------
+def _cvi_cv_anova_unbalanced(clean_df: pd.DataFrame,
+                             alpha: float = 0.05
+) -> tuple[float, tuple[float, float]]:
+    """
+    CV‑ANOVA that tolerates unequal samples‑/replicates‑per‑subject.
+
+    Steps (Røraas 2016, adapted):
+
+    1.  Normalise all results by each subject’s mean (→ mean ≈ 1).
+    2.  Construct the unbalanced mean–squares table with weights nᵢⱼ.
+    3.  σ²_WP = (MS_WP − MS_A)/ȓ      where ȓ = mean replicate count.
+    4.  Exact CI uses Burdick & Graybill χ² limits with df = Σ(Sᵢ − 1).
+    """
+    df = clean_df.copy()
+    df["Norm"] = df["Result"] / df.groupby("Subject")["Result"].transform("mean")
+
+    # ------------------------------------------------------------------ weights
+    r_ij = df.groupby(["Subject", "Sample"])["Replicate"].nunique()      # nᵢⱼ
+    r_bar = r_ij.mean()                                                 # ȓ
+
+    subj_mean = df.groupby("Subject")["Norm"].mean()
+    samp_mean = df.groupby(["Subject", "Sample"])["Norm"].mean()
+
+    # ── SS & MS (unbalanced) -----------------------------------------------
+    ss_wp = ((samp_mean - samp_mean.index.get_level_values(0).map(subj_mean))**2 *
+             r_ij).sum()
+    df_wp = (df.groupby("Subject")["Sample"].nunique() - 1).sum()
+    ms_wp = ss_wp / df_wp
+
+    ss_a  = ((df["Norm"] -
+              samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values)**2).sum()
+    df_a  = (r_ij - 1).sum()
+    ms_a  = ss_a / df_a
+
+    var_wp = max((ms_wp - ms_a) / r_bar, 0.0)
+    cvi    = np.sqrt(var_wp) * 100
+
+    # ── exact CI on σ²_WP ----------------------------------------------------
+    chi_lo = chi2.ppf(alpha/2,     df_wp)
+    chi_hi = chi2.ppf(1-alpha/2,  df_wp)
+
+    ms_lo  = (df_wp * ms_wp) / chi_hi
+    ms_hi  = (df_wp * ms_wp) / chi_lo
+
+    var_lo = max((ms_lo - ms_a) / r_bar, 0.0)
+    var_hi = max((ms_hi - ms_a) / r_bar, 0.0)
+    ci     = (np.sqrt(var_lo)*100, np.sqrt(var_hi)*100)
+
+    return cvi, ci
+
+
+# ——— helper for the unbalanced branch ——————————————————————————————
+def _calculate_bv_unbalanced(df: pd.DataFrame,
+                             alpha: float = 0.05) -> dict[str, float]:
+    """
+    Replicates the Excel ‘Glucose CVI and CVA – All’ workbook:
+
+    • σ²_A   : pure analytical variance  = MS_A  
+    • σ²_WP  : (MS_WP – MS_A) / ȓ        where ȓ is the *mean* replicate count  
+    • σ²_BP  : (MS_BP – MS_WP) / (Ś·ȓ)   Ś = *mean* samples/subject  
+
+    CIs use the same χ² limits as the balanced formula but with the actual
+    d.f. from the unbalanced ANOVA table.
+    """
+    # raw counts per cell
+    r_ij  = (df.groupby(["Subject", "Sample"])["Replicate"]
+               .nunique())
+    S_i   = df.groupby("Subject")["Sample"].nunique()
+
+    r_bar = r_ij.mean()                      # ȓ
+    S_bar = S_i.mean()                       # Ś
+
+    # ---- ordinary nested MS table (works in unbalanced designs) ----------
+    # NB: keep the sums as in the balanced code – pandas handles the weights
+    subj_mean = df.groupby("Subject")["Result"].mean()
+    samp_mean = df.groupby(["Subject", "Sample"])["Result"].mean()
+    grand     = df["Result"].mean()
+
+    ss_bp = ((samp_mean.index.get_level_values(0).map(subj_mean) - grand)**2
+              * r_ij).groupby(level=0).sum().sum()
+    ss_wp = ((samp_mean - samp_mean.index.get_level_values(0).map(subj_mean))**2
+              * r_ij).sum()
+    ss_a  = ((df["Result"]
+              - samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values)**2).sum()
+
+    I  = subj_mean.size
+    df_bp = I - 1
+    df_wp = (S_i - 1).sum()
+    df_a  = (r_ij - 1).sum()
+
+    ms_bp, ms_wp, ms_a = ss_bp/df_bp, ss_wp/df_wp, ss_a/df_a
+
+    var_A  = ms_a
+    var_WP = max((ms_wp - ms_a)/r_bar, 0.0)
+    var_BP = max((ms_bp - ms_wp)/(S_bar*r_bar), 0.0)
+
+    cv_A = np.sqrt(var_A)/grand * 100
+    cv_I = np.sqrt(var_WP)/grand * 100
+    cv_G = np.sqrt(var_BP)/grand * 100
+
+    # χ² limits – same idea, just the *unbalanced* d.f.
+    chi = chi2
+    ci_cv_A = (np.sqrt(var_A*df_a/chi.ppf(0.975, df_a))/grand*100,
+               np.sqrt(var_A*df_a/chi.ppf(0.025, df_a))/grand*100)
+    ci_cv_I = (np.sqrt(max(( (df_wp*ms_wp/chi.ppf(0.975,df_wp))-var_A)/r_bar,0))/grand*100,
+               np.sqrt(max(( (df_wp*ms_wp/chi.ppf(0.025,df_wp))-var_A)/r_bar,0))/grand*100)
+    ci_cv_G = (np.sqrt(max(( (df_bp*(ms_bp-ms_wp)/chi.ppf(0.975,df_bp)))/(S_bar*r_bar),0))/grand*100,
+               np.sqrt(max(( (df_bp*(ms_bp-ms_wp)/chi.ppf(0.025,df_bp)))/(S_bar*r_bar),0))/grand*100)
+
+    rcv = 1.96*np.sqrt(2)*np.sqrt(cv_A**2 + cv_I**2)
+
+    return dict(var_A=var_A, var_WP=var_WP, var_BP=var_BP,
+                cv_A=cv_A, cv_I=cv_I, cv_G=cv_G,
+                ci_cv_A=ci_cv_A, ci_cv_I=ci_cv_I, ci_cv_G=ci_cv_G,
+                rcv=rcv, grand=grand,
+                df_bp=df_bp, df_wp=df_wp, df_a=df_a)
+
 # ——————————————————————————————————————————————————————————————
 # 4.  Core calculation routine (closed‑form Røraas algebra)
 # ——————————————————————————————————————————————————————————————
 
 def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
-                 use_cv_anova: bool = False) -> BVResult:
+                 use_cv_anova: bool = False,
+                 enforce_balance: bool = True        # NEW PARAM
+) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
     Parameters
@@ -594,7 +950,8 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
     # -------------------------------------------------------------------------
     # 3.1  apply Braga–Panteghini outlier/normality pipeline  
     try:
-        df, pp_log = _preprocess_bv_dataframe(df, alpha=alpha)
+        df, pp_log = _preprocess_bv_dataframe(
+            df, alpha=alpha, enforce_balance=enforce_balance, flags=st.session_state.get("preproc_flags"))   # NEW ARG
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
         raise PreprocessError(str(e), e.log) from None
@@ -607,118 +964,193 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
     )
     # ------------------------------------------------------------------------
 
-    # 3.2 derive counts (I, S, R) and assert balance
-    I = df["Subject"].nunique()                                          # how many people
-    S = df.groupby("Subject")["Sample"].nunique().iloc[0]               # samples per person
-    R = df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0]  # replicates per sample
+    if not enforce_balance:                                 # ── unbalanced ──
+        ub = _calculate_bv_unbalanced(df, alpha)
 
-    # confirm every subject has S samples and every sample has R replicates
-    if not (df.groupby("Subject")["Sample"].nunique() == S).all():
-        raise ValueError("Unbalanced design: unequal samples per subject.")
-    if not (
-        df.groupby(["Subject", "Sample"])["Replicate"].nunique() == R
-    ).all():
-        raise ValueError("Unbalanced design: unequal replicates per sample.")
+        # ─── NEW ▶ dataset counts & CI on the mean ─────────────────────────
+        I_u  = df["Subject"].nunique()
+        S_u  = df.groupby("Subject")["Sample"].nunique().mean()   # mean S
+        R_u  = df.groupby(["Subject", "Sample"])["Replicate"].nunique().mean()  # mean R
 
-    # 3.3 overall mean – denominator for CV (%).
-    grand = df["Result"].mean()
+        N_tot  = len(df)
+        sd_all = df["Result"].std(ddof=1)
+        t_crit = t.ppf(1 - alpha/2, N_tot - 1)
+        ci_mean_u = (ub["grand"] - t_crit * sd_all / np.sqrt(N_tot),
+                     ub["grand"] + t_crit * sd_all / np.sqrt(N_tot))
+        # log it
+#        pp_log.append(
+#            f"✅ Unbalanced data set ready: {I_u} subjects × "
+#            f"mean {S_u:.2f} samples/subject × "
+#            f"mean {R_u:.2f} replicates/sample retained for ANOVA."
+#        )
+        pp_log.append("Unbalanced design → variance components derived with "
+                      "(method‑of‑moments) algebra.")
+        # ───────────────────────────────────────────────────────────────────
+        # ▶ optional CV‑ANOVA on the *unbalanced* data
+        cv_anova = ci_cv_anova = None
+        if use_cv_anova:                                   # honour sidebar tick
+            cv_anova, ci_cv_anova = _cvi_cv_anova_unbalanced(df, alpha)
+            pp_log.append(
+                f"CVI (CV‑ANOVA, unbalanced) calculated: {cv_anova:.2f} % "
+                f"(95 % CI {ci_cv_anova[0]:.2f}–{ci_cv_anova[1]:.2f} %)."
+            )
 
-    # 3.4 means for each hierarchical level
-    subj_mean = df.groupby("Subject")["Result"].mean()                   # \bar Y_{i..}
-    samp_mean = df.groupby(["Subject", "Sample"])["Result"].mean()      # \bar Y_{is.}
-
-    # 3.5 sums‑of‑squares according to EMS table (Røraas Eq 2)
-    ss_bp = R * S * ((subj_mean - grand) ** 2).sum()                      # between‑person
-    ss_wp = R * (
-        (samp_mean - subj_mean.loc[samp_mean.index.get_level_values(0)].values) ** 2
-    ).sum()  # within‑person (samples)
-    ss_a = (
-        (df["Result"] - samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values) ** 2
-    ).sum()  # replicate analytical error
-
-    # 3.6 convert SS → MS by dividing by appropriate degrees of freedom
-    ms_bp = ss_bp / (I - 1)               # df = I‑1
-    ms_wp = ss_wp / (I * (S - 1))         # df = I*(S‑1)
-    ms_a = ss_a / (I * S * (R - 1))       # df = I*S*(R‑1)
-
-    # 3.7 back‑solve variance components (closed‑form)
-    var_A = ms_a                                          # σ²_A
-    var_WP = max((ms_wp - ms_a) / R, 0.0)                 # σ²_WP (truncate <0 to 0)
-    var_BP = max((ms_bp - ms_wp) / (S * R), 0.0)          # σ²_BP
-
-    # 3.8 convert to CVs (%). grand mean in denominator.
-    cv_A = np.sqrt(var_A) / grand * 100
-    cv_I = np.sqrt(var_WP) / grand * 100
-    cv_G = np.sqrt(var_BP) / grand * 100
-
-    # 3.9 exact 95 % CI for CV_I using Burdick & Graybill’s method
-    df_wp = I * (S - 1)
-
-    # two‐tailed χ² quantiles
-    chi2_lower_q = chi2.ppf(alpha/2, df_wp)       # e.g. 0.025 quantile
-    chi2_upper_q = chi2.ppf(1 - alpha/2, df_wp)   # e.g. 0.975 quantile
-
-    # limits on MS_WP
-    ms_wp_lower = (df_wp * ms_wp) / chi2_upper_q
-    ms_wp_upper = (df_wp * ms_wp) / chi2_lower_q
-
-    # convert MS limits to σ²_WP limits: (MS_limit − σ²_A) ÷ R
-    ci_var_low = max((ms_wp_lower - var_A) / R, 0.0)
-    ci_var_up  = max((ms_wp_upper - var_A) / R, 0.0)
-
-    # finally back-transform to %CV
-    ci_cv_I = (
-        np.sqrt(ci_var_low) / grand * 100,
-        np.sqrt(ci_var_up)  / grand * 100,
-    )
-
-    # — 3.10 exact 95 % CI for CV_G (between-subject) ——
-    df_bp = I - 1
-    chi2_low_bp = chi2.ppf(alpha/2, df_bp)
-    chi2_up_bp  = chi2.ppf(1 - alpha/2, df_bp)
-
-    # MS_BP contains σ²_A + Rσ²_WP + SRσ²_BP; subtract lower levels first
-    adj_ms_bp = ms_bp - ms_wp
-
-    ms_bp_lower = (df_bp * adj_ms_bp) / chi2_up_bp
-    ms_bp_upper = (df_bp * adj_ms_bp) / chi2_low_bp
-
-    # convert MS limits to σ²_BP limits: MS_limit / (S*R)
-    ci_var_bp_low = max(ms_bp_lower / (S * R), 0.0)
-    ci_var_bp_up  = max(ms_bp_upper / (S * R), 0.0)
-
-    ci_cv_G = (
-        np.sqrt(ci_var_bp_low) / grand * 100,
-        np.sqrt(ci_var_bp_up)  / grand * 100,
-    )
-
-    # 3.11 reference‑change value (two‑sided, 95 %)
-    rcv = 1.96 * np.sqrt(2) * np.sqrt(cv_A**2 + cv_I**2)
-    
-    # ⟨QI-6⟩ analytical imprecision – put a note into the audit trail
-    pp_log.append(
-        f"QI 6 – analytical imprecision calculated: CVₐ = {cv_A:.2f} % "
-        f"(based on R = {R} replicate(s)/sample)."
-    )
-
-    # --- after the classic CV calculations are finished -----------------
-    cv_anova = ci_cv_anova = None
-    if use_cv_anova:
-        cv_anova, ci_cv_anova = _cvi_cv_anova(df, alpha)
-        pp_log.append(
-            f"CVI (CV-ANOVA) calculated: {cv_anova:.2f} % "
-            f"(95 % CI {ci_cv_anova[0]:.2f}–{ci_cv_anova[1]:.2f} %)."
+        return BVResult(
+            I = int(I_u),
+            S = S_u,
+            R = R_u,
+            grand_mean = ub["grand"],
+            var_A = ub["var_A"],
+            var_WP = ub["var_WP"],
+            var_BP = ub["var_BP"],
+            cv_A = ub["cv_A"],
+            cv_I = ub["cv_I"],
+            cv_G = ub["cv_G"],
+            ci_mean = ci_mean_u,
+            ci_cv_A = ub["ci_cv_A"],
+            ci_cv_I = ub["ci_cv_I"],
+            ci_cv_G = ub["ci_cv_G"],
+            rcv_95 = ub["rcv"],
+            preprocess_log = pp_log,
+            cv_I_cv_anova = cv_anova,               # ← NEW
+            ci_cv_I_cv_anova = ci_cv_anova          # ← NEW
         )
 
-    return BVResult(
-        I, S, R, grand,
-        var_A, var_WP, var_BP,
-        cv_A, cv_I, cv_G,
-        ci_cv_I, ci_cv_G, rcv,
-        preprocess_log=pp_log,
-        cv_I_cv_anova=cv_anova,
-        ci_cv_I_cv_anova=ci_cv_anova,
-    )
+
+    else:  # balanced design → use closed‑form algebra
+
+        # 3.2 derive counts (I, S, R) and assert balance
+        I = df["Subject"].nunique()                                          # how many people
+        S = df.groupby("Subject")["Sample"].nunique().iloc[0]               # samples per person
+        R = df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0]  # replicates per sample
+
+        # confirm every subject has S samples and every sample has R replicates
+        if not (df.groupby("Subject")["Sample"].nunique() == S).all():
+            raise ValueError("Unbalanced design: unequal samples per subject.")
+        if not (
+            df.groupby(["Subject", "Sample"])["Replicate"].nunique() == R
+        ).all():
+            raise ValueError("Unbalanced design: unequal replicates per sample.")
+
+        # 3.3 overall mean – denominator for CV (%).
+        grand = df["Result"].mean()
+
+        # 🔶 NEW — 95 % CI on the mean ------------------------------
+        N_tot  = len(df)
+        sd_all = df["Result"].std(ddof=1)
+        t_crit = t.ppf(1 - alpha/2, N_tot - 1)
+        ci_mean = (grand - t_crit * sd_all / np.sqrt(N_tot),
+                grand + t_crit * sd_all / np.sqrt(N_tot))
+        # -----------------------------------------------------------
+
+        # 3.4 means for each hierarchical level
+        subj_mean = df.groupby("Subject")["Result"].mean()                   # \bar Y_{i..}
+        samp_mean = df.groupby(["Subject", "Sample"])["Result"].mean()      # \bar Y_{is.}
+
+        # 3.5 sums‑of‑squares according to EMS table (Røraas Eq 2)
+        ss_bp = R * S * ((subj_mean - grand) ** 2).sum()                      # between‑person
+        ss_wp = R * (
+            (samp_mean - subj_mean.loc[samp_mean.index.get_level_values(0)].values) ** 2
+        ).sum()  # within‑person (samples)
+        ss_a = (
+            (df["Result"] - samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values) ** 2
+        ).sum()  # replicate analytical error
+
+        # 3.6 convert SS → MS by dividing by appropriate degrees of freedom
+        ms_bp = ss_bp / (I - 1)               # df = I‑1
+        ms_wp = ss_wp / (I * (S - 1))         # df = I*(S‑1)
+        ms_a = ss_a / (I * S * (R - 1))       # df = I*S*(R‑1)
+
+        # 3.7 back‑solve variance components (closed‑form)
+        var_A = ms_a                                          # σ²_A
+        var_WP = max((ms_wp - ms_a) / R, 0.0)                 # σ²_WP (truncate <0 to 0)
+        var_BP = max((ms_bp - ms_wp) / (S * R), 0.0)          # σ²_BP
+
+        # 🔶 NEW — 95 % CI on CV_A  ---------------------------------
+        df_a        = I * S * (R - 1)            # d.f. of MS_A
+        chi_low_a   = chi2.ppf(alpha/2,     df_a)
+        chi_up_a    = chi2.ppf(1-alpha/2,  df_a)
+        ci_var_a_lo = var_A * df_a / chi_up_a
+        ci_var_a_hi = var_A * df_a / chi_low_a
+        ci_cv_A     = (np.sqrt(ci_var_a_lo) / grand * 100,
+                    np.sqrt(ci_var_a_hi) / grand * 100)
+        # -----------------------------------------------------------
+
+        # 3.8 convert to CVs (%). grand mean in denominator.
+        cv_A = np.sqrt(var_A) / grand * 100
+        cv_I = np.sqrt(var_WP) / grand * 100
+        cv_G = np.sqrt(var_BP) / grand * 100
+
+        # 3.9 exact 95 % CI for CV_I using Burdick & Graybill’s method
+        df_wp = I * (S - 1)
+
+        # two‐tailed χ² quantiles
+        chi2_lower_q = chi2.ppf(alpha/2, df_wp)       # e.g. 0.025 quantile
+        chi2_upper_q = chi2.ppf(1 - alpha/2, df_wp)   # e.g. 0.975 quantile
+
+        # limits on MS_WP
+        ms_wp_lower = (df_wp * ms_wp) / chi2_upper_q
+        ms_wp_upper = (df_wp * ms_wp) / chi2_lower_q
+
+        # convert MS limits to σ²_WP limits: (MS_limit − σ²_A) ÷ R
+        ci_var_low = max((ms_wp_lower - var_A) / R, 0.0)
+        ci_var_up  = max((ms_wp_upper - var_A) / R, 0.0)
+
+        # finally back-transform to %CV
+        ci_cv_I = (
+            np.sqrt(ci_var_low) / grand * 100,
+            np.sqrt(ci_var_up)  / grand * 100,
+        )
+
+        # — 3.10 exact 95 % CI for CV_G (between-subject) ——
+        df_bp = I - 1
+        chi2_low_bp = chi2.ppf(alpha/2, df_bp)
+        chi2_up_bp  = chi2.ppf(1 - alpha/2, df_bp)
+
+        # MS_BP contains σ²_A + Rσ²_WP + SRσ²_BP; subtract lower levels first
+        adj_ms_bp = ms_bp - ms_wp
+
+        ms_bp_lower = (df_bp * adj_ms_bp) / chi2_up_bp
+        ms_bp_upper = (df_bp * adj_ms_bp) / chi2_low_bp
+
+        # convert MS limits to σ²_BP limits: MS_limit / (S*R)
+        ci_var_bp_low = max(ms_bp_lower / (S * R), 0.0)
+        ci_var_bp_up  = max(ms_bp_upper / (S * R), 0.0)
+
+        ci_cv_G = (
+            np.sqrt(ci_var_bp_low) / grand * 100,
+            np.sqrt(ci_var_bp_up)  / grand * 100,
+        )
+
+        # 3.11 reference‑change value (two‑sided, 95 %)
+        rcv = 1.96 * np.sqrt(2) * np.sqrt(cv_A**2 + cv_I**2)
+        
+        # ⟨QI-6⟩ analytical imprecision – put a note into the audit trail
+        pp_log.append(
+            f"QI 6 – analytical imprecision calculated: CVₐ = {cv_A:.2f} % "
+            f"(based on R = {R} replicate(s)/sample)."
+        )
+
+        # --- after the classic CV calculations are finished -----------------
+        cv_anova = ci_cv_anova = None
+        if use_cv_anova:
+            cv_anova, ci_cv_anova = _cvi_cv_anova(df, alpha)
+            pp_log.append(
+                f"CVI (CV-ANOVA) calculated: {cv_anova:.2f} % "
+                f"(95 % CI {ci_cv_anova[0]:.2f}–{ci_cv_anova[1]:.2f} %)."
+            )
+
+        return BVResult(
+            I, S, R, grand,
+            var_A, var_WP, var_BP,
+            cv_A, cv_I, cv_G,
+            ci_mean,          # add here
+            ci_cv_A,          # add here
+            ci_cv_I, ci_cv_G, rcv,
+            preprocess_log = pp_log,
+            cv_I_cv_anova = cv_anova,
+            ci_cv_I_cv_anova = ci_cv_anova,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -860,6 +1292,39 @@ with st.sidebar:
         "3. Click on **Calculate** button"
     )
     st.divider()
+
+    # ─────────────────────────────────────────────────────────────
+    # Pre‑processing switches – default = all ON
+    # ─────────────────────────────────────────────────────────────
+    st.sidebar.subheader("Pre‑processing steps")
+
+    PREPROC_OPTS = {
+        # label                        internal key            default
+        "Replicate Cochran (QI 8a)"  : ("rep_cochran",          True),
+        "Replicate Bartlett (QI 8a)" : ("rep_bartlett",         True),
+        "Sample Cochran (QI 8b)"     : ("samp_cochran",         True),
+        "Reed between‑subject (QI 8c)":("reed",                 True),
+        "Steady‑state drift (QI 7)"  : ("drift",                True),
+        "Normality checks / log‑transform (QI 9)"
+                                    : ("normality",           True),
+        "Within‑subject Bartlett (QI 10)"
+                                    : ("wp_bartlett",         True),
+    }
+
+    # build the check‑boxes and stash the chosen flags in session_state
+    preproc_flags = {}
+    for label, (key, default) in PREPROC_OPTS.items():
+        preproc_flags[key] = st.sidebar.checkbox(label, value=default)
+    st.session_state["preproc_flags"] = preproc_flags
+
+    # Crossed design balance enforcement
+    st.sidebar.subheader("Analysis options")                    # NEW
+    enforce_balance = st.sidebar.checkbox(                      # NEW
+        "Enforce balanced crossed design",                      # NEW
+        value=True,                                             # NEW (default keeps old behaviour)
+    )                                                           # NEW
+    st.session_state["enforce_balance"] = enforce_balance       # NEW
+
     st.subheader("Need an example file?")
     with open('./template/bv_data_template.xlsx', "rb") as template_file:
         template_byte = template_file.read()
@@ -872,22 +1337,25 @@ with st.sidebar:
     st.info('*Developed by Hikmet Can Çubukçu, MD, PhD, MSc, EuSpLM* <hikmetcancubukcu@gmail.com>')
 
 
-
 # 6.3 three tabs – three data‑entry modes
 upload_tab, entry_tab = st.tabs(["Upload", "Manual Entry"])
 
-user_df: pd.DataFrame | None = None  # will hold whichever dataframe the user supplies
+# NEW ▸ make sure the variable always exists
+user_df: pd.DataFrame | None = None
 
-# — Tab 1: Upload —
+# -- Tab 1: Upload -----------------------------------------------------------
 with upload_tab:
     up_file = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"])
     if up_file is not None:
         try:
-            # decide reader based on extension
             if up_file.name.lower().endswith("xlsx"):
                 user_df = pd.read_excel(up_file)
             else:
                 user_df = pd.read_csv(up_file)
+
+            # NEW ➜ strip accidental index column
+            user_df = _strip_ghost_index(user_df)
+
             st.success("File loaded ✓ – please review below.")
         except Exception as e:
             st.error(f"Load error: {e}")
@@ -907,19 +1375,18 @@ with entry_tab:
         use_container_width=True,
         key="editor",
     )
+    if manual_df.dropna().shape[0] >= 4:
+        user_df = _strip_ghost_index(manual_df.copy())
     # save edits back to session
     st.session_state.manual_df = manual_df
 
-    # only accept manual_df as user_df if at least 4 fully populated rows exist
-    if manual_df.dropna().shape[0] >= 4:
-        user_df = manual_df.copy()
 
 # ——————————————————————————————————————————————————————————————
 # 7. Preview & calculate button
 # ——————————————————————————————————————————————————————————————
 if user_df is not None:
     st.subheader("Data preview")
-    st.dataframe(user_df, use_container_width=True)
+    st.dataframe(user_df, use_container_width=True, hide_index=True)
 
 
     # — Column mapping (collapsed until user opens it) —
@@ -965,7 +1432,8 @@ if user_df is not None:
             try:
                 res = calculate_bv(
                     df_for_calc,
-                    use_cv_anova=st.session_state.get("use_cv_anova", False)
+                    use_cv_anova=st.session_state.get("use_cv_anova", False),
+                    enforce_balance = st.session_state.get("enforce_balance", True)   # NEW
                 )
 
 
@@ -976,8 +1444,12 @@ if user_df is not None:
 
                 # --- build the metrics list ---
                 metrics = [
-                    ("Mean",            f"{res.grand_mean:.2f}",                                   None),
-                    ("CV<sub>A</sub>",  f"{res.cv_A:.2f} %",                                       None),
+                    ("Mean",
+                    f"{res.grand_mean:.2f}",
+                    f"{res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f} CI"),
+                    ("CV<sub>A</sub>",
+                    f"{res.cv_A:.2f} %",
+                    f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}% CI"),
                     ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span>",
                         f"{res.cv_I:.2f} %",
                         f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}% CI"),
@@ -1033,13 +1505,14 @@ if user_df is not None:
                 st.write(" ")
                 st.subheader("Summary of variation metrics")
                 var_tbl = pd.DataFrame({
-                    "Component": ["Analytical", "Within-subject", "Between-subject"],
-                    "Variance":  [res.var_A, res.var_WP, res.var_BP],
-                    "CV %":      [res.cv_A, res.cv_I, res.cv_G],
-                    "95 % CI":   ["–",
-                                f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f} %",
-                                f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f} %"],
+                    "Component": ["Analytical", "Within‑subject", "Between‑subject"],
+                    "Variance":  [res.var_A,    res.var_WP,      res.var_BP],
+                    "CV %":      [res.cv_A,     res.cv_I,        res.cv_G],
+                    "95 % CI":   [f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f} %",
+                                f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f} %",
+                                f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f} %"],
                 })
+
                 st.dataframe(
                     var_tbl.style
                         .format({"Variance": "{:.3f}", "CV %": "{:.2f}"})
@@ -1056,135 +1529,156 @@ if user_df is not None:
 
 
                 # — Per-subject mean ± range plot ————————————————————————————————
-                clean_df, _ = _preprocess_bv_dataframe(df_for_calc)
+                clean_df, _ = _preprocess_bv_dataframe(
+                    df_for_calc,
+                    flags=st.session_state["preproc_flags"],      # ← add
+                    enforce_balance=st.session_state["enforce_balance"]
+                )
                 st.subheader("Per-subject distribution")
                 st.plotly_chart(plot_subject_ranges(clean_df), use_container_width=True)
 
 
-                # ─────────────────────────────────────────────────────────────────────────────
-                #  📋  BIVAC CHECKLIST  (QI-6 → QI-13)
-                #      Grades:  A (best) → D (unreliable)
-                # ─────────────────────────────────────────────────────────────────────────────
-                def _build_qi_checklist(log_lines: list[str], res: BVResult) -> pd.DataFrame:
-                    """
-                    Create a BIVAC quality table that covers QI-6 … QI-13.
+                # ---------------------------------------------------------------------------
+                #  📋  BIVAC CHECKLIST  (QI 6 → QI 14)
+                #      – fills Comment / Details and skips QI 1‑5
+                # ---------------------------------------------------------------------------
+                import re
+                from collections import defaultdict
 
-                    • Every row starts at grade “A”.  
-                    • We **only** downgrade when the *requirement itself* is not fulfilled –
-                    finding / removing drifts or outliers does **NOT** lower the score
-                    (BIVAC rewards the presence of those checks).  
-                    • The “Details” column is populated with quantitative numbers and the
-                    exact log lines that justify the given grade.
+                def _build_qi_checklist(
+                        log_lines: list[str],
+                        res: BVResult,
+                        flags: dict[str, bool],
+                ) -> pd.DataFrame:
+                    """
+                    Build a BIVAC v1.1 checklist exactly as defined in Aarsand et al. 2018,
+                    but **only for QI 6‑14** and with 2 new features:
+
+                    • *Comment*  – short human‑readable explanation of the grade  
+                    • *Details*  – concatenation of **all** log lines relevant to that QI  
+
+                    Critical items (6‑8‑10‑11‑13) still auto‑downgrade to D when they
+                    would otherwise have received C (see Table 1 of the paper).
                     """
 
-                    # ── canonical explanations (taken from the BIVAC PDF) ──────────────────
-                    expl = {
-                        "6": "Analytical imprecision documented (CVₐ from duplicates / IQC)",
-                        "7": "Subjects in steady-state (individual time-trend examined)",
-                        "8": "Comprehensive outlier handling (replicates, samples, subjects)",
-                        "9": "Normal distribution achieved (raw or after transformation)",
-                        "10": "Homogeneity of within-subject variances (Bartlett, p > 0.05)",
-                        "11": "Appropriate 2-level (nested) ANOVA model applied",
-                        "12": "Exact 95 % confidence limits reported",
-                        "13": "Transparency on number of results retained vs. excluded",
-                        "14": "Mean concentration reported",          
+                    # ------------------------------------------------------------------ helpers
+                    def worst(g1, g2):                        # strict min on the A>B>C>D scale
+                        order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+                        return g1 if order[g1] >= order[g2] else g2
+
+                    # ════════════════════════════════════════════════════════════════════════
+                    # 1.  Grade assessment  (same logic you already had, but no QI 1‑5)
+                    #    ––––– I moved the old logic into a small dict for clarity –––––
+                    # ════════════════════════════════════════════════════════════════════════
+                    grade, comment = {}, {}       # QI ➜ grade / comment (A–D)
+
+                    # ---------- QI 6  (replicates / analytical imprecision) -----------------
+                    grade["6"]   = "A" if res.R >= 2 else "C"
+                    comment["6"] = f"{res.R} replicates per sample detected."
+                    # ---------- QI 7  (steady‑state / drift) --------------------------------
+                    drift = any("temporal drift" in l.lower() for l in log_lines)
+                    grade["7"]   = "A"
+                    comment["7"] = "Significant drift subjects removed." if drift else "No drift detected."
+                    # ---------- QI 8  (outlier handling) ------------------------------------
+                    rep_ok  = flags.get("rep_cochran", True)
+                    samp_ok = flags.get("samp_cochran", True)
+                    subj_ok = flags.get("reed",        True)
+
+                    if rep_ok and samp_ok and subj_ok:
+                        grade["8"] = "A"
+                        comment["8"] = "Replicate, sample and subject‑level outlier tests performed."
+                    elif samp_ok and subj_ok:
+                        grade["8"] = "B"
+                        comment["8"] = "Replicate‑level outlier test skipped."
+                    elif samp_ok:
+                        grade["8"] = "B"
+                        comment["8"] = "Replicate‑ & subject‑level outlier tests skipped."
+                    else:
+                        grade["8"] = "C"
+                        comment["8"] = "Only partial outlier testing."
+                    # ---------- QI 9  (normality) ------------------------------------------
+                    transformed = any("log transform applied" in l.lower() for l in log_lines)
+                    grade["9"]   = "A"
+                    comment["9"] = "Log‑transform applied." if transformed else "Gaussian on raw scale."
+                    # ---------- QI 10 (variance homogeneity) -------------------------------
+                    het = any("heterogeneous" in l.lower() for l in log_lines)
+                    if not flags.get("wp_bartlett", True):
+                        grade["10"] = "B"
+                        comment["10"] = "Variance homogeneity test skipped."
+                    else:
+                        grade["10"] = "A" if not het else "C"
+                        comment["10"] = "Variances homogeneous." if not het else "Heterogeneous variances."
+                    # ---------- QI 11 (ANOVA model) ----------------------------------------
+                    balanced = res.S == int(res.S) and res.R == int(res.R)
+                    grade["11"]   = "A" if balanced else "B"
+                    comment["11"] = "Balanced nested ANOVA." if balanced else "Method‑of‑moments (unbalanced)."
+                    # ---------- QI 12 (confidence limits) ----------------------------------
+                    grade["12"]   = "A"
+                    comment["12"] = "95 % CIs on CVA/CVI/CVG reported."
+                    # ---------- QI 13 (numbers kept) ---------------------------------------
+                    grade["13"]   = "A"
+                    kept = res.I * res.S * res.R
+                    comment["13"] = f"{kept} results retained after QC."
+                    # ---------- QI 14 (mean concentration) ---------------------------------
+                    grade["14"]   = "A"
+                    comment["14"] = f"Mean concentration {res.grand_mean:.2f}."
+
+                    # ------------------------------------------------------------------ auto‑downgrade critical items to D
+                    for q in ("6", "8", "10", "11", "13"):
+                        if grade[q] == "C":
+                            grade[q] = "D"
+                            comment[q] += "  (critical item downgraded to D)"
+
+                    # ════════════════════════════════════════════════════════════════════════
+                    # 2.  Map preprocessing log → Details column
+                    # ════════════════════════════════════════════════════════════════════════
+                    # simple pattern map: QI ➜ keywords expected in that log line
+                    patterns = {
+                        "6": ("cvₐ", "analytical imprecision"),
+                        "7": ("drift",),
+                        "8": ("outlier",),
+                        "9": ("normality", "log transform"),
+                        "10": ("bartlett", "heterogeneous"),
+                        "11": ("balanced", "unbalanced", "anova"),
+                        "13": ("subject", "sample", "replicate", "results retained"),
+                        "14": ("mean",),
+                        # QI 12 has no explicit log hooks – we’ll leave Details blank
                     }
 
-                    # ── helper: make one blank† row  ────────────────────────────────────────
-                    def _row(qi: str) -> dict[str, str]:
-                        return dict(
-                            QI=f"QI {qi}",
-                            Grade="A",
-                            Comment="Meets recommendation",
-                            Explanation=expl[qi],
-                            Details="",
-                        )
+                    details = defaultdict(list)
+                    for line in log_lines:
+                        line_l = line.lower()
+                        for q, keys in patterns.items():
+                            if any(k in line_l for k in keys):
+                                details[q].append(line)
 
-                    rows = {q: _row(q) for q in expl}
+                    # ════════════════════════════════════════════════════════════════════════
+                    # 3.  Assemble DataFrame (QI 6‑14) and overall grade
+                    # ════════════════════════════════════════════════════════════════════════
+                    rows, overall = [], "A"
+                    for q in map(str, range(6, 15)):
+                        overall = worst(overall, grade[q])
+                        rows.append(dict(
+                            QI      = f"QI {q}",
+                            Grade   = grade[q],
+                            Comment = comment[q],
+                            Details = " ⏵ ".join(details.get(q, []))          # nice arrow separator
+                        ))
 
-                    # pre-populate quantitative fields (always valuable)
-                    rows["6"]["Details"]  = f"CVₐ = {res.cv_A:.2f} %"
-                    rows["12"]["Details"] = (
-                        f"CVᵢ 95 % CI {res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f} %; "
-                        f"CVg 95 % CI {res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f} %"
-                    )
-                    rows["12"]["Details"] += (
-                        f"; CVᵢ (CV-ANOVA) 95 % CI "
-                        f"{res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f} %"
-                        if res.cv_I_cv_anova is not None else ""
-                    )
-                    rows["13"]["Details"] = (
-                        f"Subjects = {res.I} • "
-                        f"Samples/subject = {res.S} • "
-                        f"Replicates/sample = {res.R}  →  N = {res.I*res.S*res.R}"
-                    )
-                    rows["14"]["Details"] = f"Mean = {res.grand_mean:.2f}"
-                    rows["11"]["Details"] = (
-                        f"Balanced two-level nested ANOVA (Røraas 2012) "
-                        f"with I = {res.I}, S = {res.S}, R = {res.R}"
-                    )
-                    # ── scan the verbose log to adjust grades / add notes ──────────────────
-                    for raw in log_lines:
-                        l = raw.lower()
-                        # QI-6  (analytical imprecision)  ← NEW
-                        if "qi 6 – analytical" in l:
-                            rows["6"]["Details"] += " · " + raw
-
-                        # downgrade QI-6 if no duplicates / replicates
-                        if "qi 6 – analytical imprecision" in l:
-                            if res.R < 2:
-                                rows["6"]["Grade"]   = "C"
-                                rows["6"]["Comment"] = "Single measurements – CVₐ not demonstrable"
-
-                        # QI-7  (steady-state)
-                        if "temporal drift" in l:
-                            rows["7"]["Comment"] = "Drift detected; affected subject removed"
-                            rows["7"]["Details"] += (" · " + raw)
-
-                        # QI-8  (outliers)
-                        if "duplicate-pair outlier" in l:
-                            rows["8"]["Details"] += (" · " + raw)
-                        if ("reed mean outlier" in l) or ("cochran variance outlier" in l):
-                            rows["8"]["Details"] += (" · " + raw)
-
-                        # QI-9  (normality)
-                        if "normality check (qi 9)" in l or "subject-means sw p" in l:
-                            rows["9"]["Details"] += " · " + raw
-
-                        if "✅ qi 9 satisfied" in l:
-                            rows["9"]["Details"] += " · Gaussian assumption met"
-
-                        # optional – flag that success relied on a log-transform
-                        if "log transform applied" in l and rows["9"]["Grade"] == "A":
-                            rows["9"]["Comment"] = "Accepted after log-transform"
-
-                        # QI-10  (variance homogeneity)
-                        if "bartlett test" in l:
-                            rows["10"]["Details"] += (" · " + raw)
-                            if "heterogeneous" in l:
-                                rows["10"]["Grade"]   = "C"
-                                rows["10"]["Comment"] = "Variances heterogeneous (p < 0.05)"
-
-                        # QI-13  (result transparency)
-                        if ("subject excluded" in l) or ("sample removed" in l):
-                            rows["13"]["Details"] += (" · " + raw)
-
-                    # ── turn into tidy DataFrame – order by QI number, A→D categorical grade
-                    df = (pd.DataFrame(rows.values())
-                            # NEW: extract the number (6-14) and sort on it numerically
-                            .assign(_num=lambda d: d["QI"].str.extract(r"(\d+)").astype(int))
-                            .assign(Grade=lambda d: pd.Categorical(
-                                d["Grade"], categories=list("ABCD"), ordered=True))
-                            .sort_values("_num")        # ensures 6 < 7 < … < 14
-                            .drop(columns="_num")       # housekeeping column no longer needed
-                            .reset_index(drop=True)
-                    )
+                    df = pd.DataFrame(rows)
+                    df.attrs["overall_grade"] = overall
                     return df
+
+
 
 
                 # ── render the checklist & XLSX download ────────────────────────────────────
                 st.subheader("BIVAC Checklist (QI 6 → QI 14)")
-                bivac_df = _build_qi_checklist(res.preprocess_log, res)
+                bivac_df = _build_qi_checklist(
+                    res.preprocess_log,
+                    res,
+                    flags = st.session_state["preproc_flags"]
+                )
 
                 st.dataframe(
                     bivac_df.style.apply(
@@ -1195,6 +1689,8 @@ if user_df is not None:
                     use_container_width=True,
                     hide_index=True,
                 )
+                overall = bivac_df.attrs["overall_grade"]
+                st.markdown(f"**Overall BIVAC grade: {overall}**")
 
                 # ⬇️  Excel export (tries xlsxwriter → falls back to openpyxl)
                 with st.expander("⇢ Download checklist"):
@@ -1230,6 +1726,7 @@ if user_df is not None:
                 for line in e.log:
                     st.write("•", line)                  # bullet list
             except Exception as e:
+                st.write(e)
                 st.error(f"Calculation failed: {e}")     # any other unexpected error
 
         except Exception as e:
