@@ -41,6 +41,7 @@ from scipy.stats import chi2 , t            # chi‑square for exact CI of varia
 from scipy.stats import shapiro, kstest, f              # normality + Cochran
 from scipy.stats import bartlett, linregress  
 import plotly.graph_objects as go   # ← NEW
+import re, html
 
 # ——————————————————————————————————————————————————————————————
 # 1.  Streamlit page config (title, layout)
@@ -135,10 +136,66 @@ st.markdown(
         color: #1e3a5f;
         text-shadow: 0 1px 1px rgba(255,255,255,0.9);
       }
+      /* ==== Preprocessing log highlighting ==== */
+    .log-list{ list-style: none; padding-left: 0; margin: 0; }
+    .log-item{ margin: .25rem 0; }
+    .log-outlier{ color:#b00020; font-weight:700; }   /* red = outliers/exclusions */
+    .log-sig{     color:#a15c00; font-weight:700; }   /* amber = significant stats */
+    .log-action{  color:#004c97; font-weight:700; }   /* blue = major manipulation */
     </style>
     """,
     unsafe_allow_html=True
 )
+
+
+# --- BIVAC QI 1–5 definitions (Aarsand 2018 Table 1) ---
+QI15_CHOICES = {
+    "QI 1 – Scale": {
+        "help": "Is the measurand given on a ratio scale?",
+        "options": {
+            "A": "Yes (ratio scale)",
+            "B": "No (non-ratio scale)",
+        },
+    },
+    "QI 2 – Subjects": {
+        "help": "Subjects/population documented: (a) number; (b) sex; (c) age/age group; (d) health status.",
+        "options": {
+            "A": "All (a,b,c,d) documented",
+            "B": "All documented but only 'healthy volunteers' given",
+            "C": "(a) and (d) documented; missing (b)/(c) not important",
+            "D": "(a) and (d) documented; missing (b)/(c) important OR (a)/(d) missing",
+        },
+    },
+    "QI 3 – Samples": {
+        "help": "Documented: (a) #samples; (b) sample material; (c) timing; (d) study length.",
+        "options": {
+            "A": "Yes (a,b,c,d) documented",
+            "B": "(a,c,d) documented; (b) insufficient but not important",
+            "C": "(a,c,d) documented; (b) insufficient and important",
+            "D": "(a), (c) and/or (d) not presented/deducible",
+        },
+    },
+    "QI 4 – Measurand/Method": {
+        "help": "Method documented sufficiently / fit for BV estimation.",
+        "options": {
+            "A": "Detailed method or adequate reference/identifiable method",
+            "B": "Insufficient detail (not important for measurand)",
+            "C": "Insufficient detail or outdated (important for measurand)",
+            "D": "Obsolete / not fit for BV estimation",
+        },
+    },
+    "QI 5 – Preanalytical": {
+        "help": "Preanalytical procedures standardized to minimize variation.",
+        "options": {
+            "A": "Yes (adequate)",
+            "B": "Insufficient detail (unlikely important)",
+            "C": "Insufficient detail (may be important)",
+            "D": "No details provided",
+        },
+    },
+}
+
+
 
 # ─── custom exception that stores the log ──────────────────────────────
 class PreprocessError(ValueError):
@@ -224,6 +281,124 @@ def _strip_ghost_index(df: pd.DataFrame) -> pd.DataFrame:
     if not df.empty and (df.columns[0] == "" or df.columns[0].startswith("Unnamed")):
         return df.iloc[:, 1:]
     return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mapping validation
+# ─────────────────────────────────────────────────────────────────────────────
+def _validate_and_build_mapping(df: pd.DataFrame,
+                                subj_sel: str, samp_sel: str, repl_sel: str, res_sel: str
+) -> tuple[pd.DataFrame | None, list[str], list[str]]:
+    """Return (mapped_df, errors, warnings). Ensures 4 distinct columns and numeric 'Result'."""
+    errors, warnings = [], []
+
+    # Distinct columns?
+    chosen = [subj_sel, samp_sel, repl_sel, res_sel]
+    if len(set(chosen)) != 4:
+        errors.append("Please select **four different columns** (no duplicates).")
+
+    # Build mapped view early so we can check types
+    mapped = df.rename(columns={
+        subj_sel: "Subject",
+        samp_sel: "Sample",
+        repl_sel: "Replicate",
+        res_sel:  "Result",
+    })[["Subject", "Sample", "Replicate", "Result"]].copy()
+
+    # Coerce numeric columns
+    mapped["Result"] = pd.to_numeric(mapped["Result"], errors="coerce")
+    n_bad_res = mapped["Result"].isna().sum()
+    if n_bad_res:
+        errors.append(f"'Result / value' must be numeric → {n_bad_res} row(s) are non-numeric.")
+
+    # Sample & Replicate should be numeric (visit/timepoint & within-sample repeat index)
+    mapped["Sample"] = pd.to_numeric(mapped["Sample"], errors="coerce")
+    mapped["Replicate"] = pd.to_numeric(mapped["Replicate"], errors="coerce")
+    if mapped["Sample"].isna().any():
+        errors.append("'Sample / time-point' must be numeric (e.g., 1, 2, 3).")
+    if mapped["Replicate"].isna().any():
+        errors.append("'Replicate' must be numeric (e.g., 1, 2).")
+
+    # Light sanity notes
+    if mapped["Subject"].isna().any():
+        warnings.append("Some Subject IDs are blank.")
+    if mapped.dropna().empty:
+        errors.append("All mapped values are empty after type checks.")
+
+    return (None, errors, warnings) if errors else (mapped, errors, warnings)
+
+
+def _render_log_html(lines: list[str], alpha: float = 0.05) -> str:
+    """Return an HTML bullet list where important log messages are bold & colored."""
+    def classify(line: str) -> str:
+        L = line.lower()
+
+        # --- Make "no outlier ..." lines plain (early exit) ---
+        if ("no outlier detected" in L
+            or "no between-subject outliers" in L
+            or "no outliers detected" in L):
+            return ""
+
+        # --- Heterogeneous anywhere → emphasize (amber) ---
+        if "heterogeneous" in L:
+            return "log-sig"   # bold + amber via your CSS
+
+        # --- Outliers / removals (red) ---
+        if ("outlier removed" in L or "reed mean outlier" in L or " → outlier" in L
+            or ("excluded" in L and "drift" in L)):
+            return "log-outlier"
+
+        # --- Significant tests (amber) ---
+        m = re.search(r"\bp\s*=\s*([0-9]*\.?[0-9]+)", L)
+        if m:
+            try:
+                if float(m.group(1)) < alpha:
+                    return "log-sig"
+            except ValueError:
+                pass
+        if ("gcrit" in L and "→ outlier" in L):
+            return "log-sig"
+
+        if "high within-subject variance" in L or "high analytical variance" in L:
+            return "log-sig"
+
+        # --- Major manipulations (blue) ---
+        if any(k in L for k in [
+            "natural-log transform applied", "log transform applied",
+            "balance check", "subject **excluded**", "sample **removed**",
+            "dropped", "discarded",
+            "unbalanced design →", "balanced data set ready",
+        ]):
+            return "log-action"
+
+        # otherwise: plain
+        return ""
+
+    items = []
+    for ln in lines:
+        cls = classify(ln)
+        safe = html.escape(ln)
+        if cls:
+            items.append(f"<li class='log-item'><span class='{cls}'>{safe}</span></li>")
+        else:
+            items.append(f"<li class='log-item'>{safe}</li>")
+    return "<ul class='log-list'>" + "\n".join(items) + "</ul>"
+
+def _style_details_series(s: pd.Series) -> list[str]:
+    """Make 'Details' text non-colored; keep bold for important rows."""
+    triggers = [
+        "outlier", "excluded", "dropped", "discarded",
+        "log transform", "heterogeneous", "temporal drift",
+        "high within-subject variance", "high analytical variance"
+    ]
+    styles = []
+    for val in s.astype(str).str.lower():
+        if any(k in val for k in triggers):
+            styles.append("font-weight:700;")          # no color
+        else:
+            styles.append("")                           # default text color
+    return styles
+
+
 
 # ——————————————————————————————————————————————————————————————
 # 3-bis.  Braga–Panteghini flow-chart utilities
@@ -1337,11 +1512,95 @@ with st.sidebar:
     st.info('*Developed by Hikmet Can Çubukçu, MD, PhD, MSc, EuSpLM* <hikmetcancubukcu@gmail.com>')
 
 
-# 6.3 three tabs – three data‑entry modes
-upload_tab, entry_tab = st.tabs(["Upload", "Manual Entry"])
+# 6.3 tabs – add an Instructions tab
+instr_tab, upload_tab, entry_tab = st.tabs(["Instructions", "Upload", "Manual Entry"])
+
+with instr_tab:
+    st.subheader("How this app works (quick guide)")
+    st.markdown(
+        """
+1. **Prepare your data** as a tidy table with four columns:
+   - **Subject** – participant ID (e.g., `P01`, `MRN123`).
+   - **Sample / time-point** – visit/order **as integers**: `1, 2, 3…`.
+   - **Replicate** – within-sample repeat **as integers**: `1, 2…`.
+   - **Result / value** – the numeric measurement (one unit).
+2. **Upload** a CSV/XLSX or use **Manual Entry**.
+3. **Map / confirm columns** in the expander and click **Save mapping**.
+4. (Optional) Adjust **Pre-processing steps** and **Analysis options** in the sidebar.
+5. Click **Calculate** to get CVₐ, CVᵢ, CVg, 95% CIs, RCV, per-subject plot, and a BIVAC checklist.
+        """
+    )
+
+    st.divider()
+    c1, c2 = st.columns([0.55, 0.45], gap="large")
+
+    with c1:
+        st.markdown("### Data format – minimum rules")
+        st.markdown(
+            """
+- **Subject** can be text or numbers (blanks discouraged).
+- **Sample** and **Replicate** **must be numeric**; non-numeric entries will error.
+- **Result** **must be numeric**; non-numeric rows are rejected during mapping.
+- Balanced designs (**same S and R for all subjects**) enable closed-form ANOVA.
+- Unbalanced is allowed if you untick **“Enforce balanced crossed design”** (sidebar).
+            """
+        )
+        st.markdown("**Example structure (first rows of the built-in template):**")
+        st.dataframe(_template_df.head(8), use_container_width=True, hide_index=True)
+       
+        st.markdown("### Outputs you get")
+        st.markdown(
+            """
+- **Key metrics**: Mean, **CVₐ**, **CVᵢ**, **CVg**, 95% CIs, and **RCV (95%)**.
+- **Per-subject mean ± range** plot.
+- **BIVAC checklist (QI 1–14)** with export to Excel.
+- **Pre-processing log** with highlighted actions/outliers.
+            """
+        )
+
+    with c2:
+        st.markdown("### What the pre-processing switches do")
+        st.markdown(
+            """
+- **Replicate Cochran (QI 8a)**: flags replicate-set variance outliers.
+- **Replicate Bartlett (QI 8a)**: checks homogeneity of replicate variances.
+- **Sample Cochran (QI 8b)**: flags high-variance samples within each subject.
+- **Reed between-subject (QI 8c)**: removes extreme subject means.
+- **Steady-state drift (QI 7)**: removes subjects with significant time trend.
+- **Normality checks / log-transform (QI 9)**: Shapiro–Wilk; log if needed.
+- **Within-subject Bartlett (QI 10)**: homogeneity of within-subject variances.
+- **Enforce balanced crossed design**: keeps only subjects/samples that fit the modal S and R.
+- **Estimate CVI with CV-ANOVA**: optional CVᵢ via normalization approach.
+            """
+        )
+
+        st.markdown("### Recommended study design")
+        st.info("**≥20 subjects**, **≥3 samples/subject**, **≥2 replicates/sample** is a good starting point.", icon="✅")
+
+
+
+    st.divider()
+    with st.expander("Troubleshooting", expanded=False):
+        st.markdown(
+            """
+- **“Missing required columns”** → check mapping or rename columns then remap.
+- **“'Sample/Replicate' must be numeric”** → fix non-numeric entries before mapping.
+- **“Normality could not be achieved”** → try enabling log-transform (QI 9) or review outliers.
+- **“All data removed during QC”** → relax switches, or untick **Enforce balanced crossed design**.
+            """
+        )
+    st.caption("Tip: You can also download the template from the sidebar.")
+
 
 # NEW ▸ make sure the variable always exists
 user_df: pd.DataFrame | None = None
+# NEW: Invalidate saved mapping if the incoming dataframe's columns changed
+if user_df is not None:
+    prev_cols = st.session_state.get("mapped_source_cols")
+    if prev_cols is None or list(prev_cols) != list(user_df.columns):
+        st.session_state["mapping_ok"] = False
+        st.session_state["mapped_df"] = None
+        st.session_state["mapped_source_cols"] = list(user_df.columns)
 
 # -- Tab 1: Upload -----------------------------------------------------------
 with upload_tab:
@@ -1380,6 +1639,11 @@ with entry_tab:
     # save edits back to session
     st.session_state.manual_df = manual_df
 
+# NEW: persistent mapping state gate
+if "mapping_ok" not in st.session_state:
+    st.session_state["mapping_ok"] = False
+if "mapped_df" not in st.session_state:
+    st.session_state["mapped_df"] = None
 
 # ——————————————————————————————————————————————————————————————
 # 7. Preview & calculate button
@@ -1388,46 +1652,117 @@ if user_df is not None:
     st.subheader("Data preview")
     st.dataframe(user_df, use_container_width=True, hide_index=True)
 
+    if st.session_state.get("mapping_ok", False):
+        st.success("A valid mapping is saved for this dataset.")
+    else:
+        st.info("Please map the four required columns below.")
 
     # — Column mapping (collapsed until user opens it) —
-    with st.expander("⇢  Map / confirm columns", expanded=False):
+    # — Column mapping (open until valid) —
+    with st.expander("⇢  Map / confirm columns", expanded=not st.session_state.get("mapping_ok", False)):
+        st.markdown("""
+    **Why mapping?** The calculator needs to know which column is the **subject**, which is the **time-point**, the **replicate index**, and the numeric **result**.  
+    This ensures the ANOVA reads the hierarchy correctly (Subject → Sample/visit → Replicate).
+
+    **How to choose**
+    - **Subject identifier:** a stable participant ID (e.g., `P01`, `MRN1234`).  
+    - **Sample / time-point:** the order of collections per subject (e.g., `1, 2, 3…`).  
+    - **Replicate:** within-sample repeat index (`1, 2, 3…`) from the same run/tube.  
+    - **Result / value:** the analyte measurement as a **single numeric** value in one unit.
+    """)
+
         cols = list(user_df.columns)
         with st.form("map_form"):
             c1, c2 = st.columns(2)
             with c1:
                 subj_sel = st.selectbox("Subject identifier",  cols,
-                                        index=_default_idx("Subject", cols))
+                                        index=_default_idx("Subject", cols),
+                                        help="Unique person/participant code.")
                 samp_sel = st.selectbox("Sample / time-point", cols,
-                                        index=_default_idx("Sample", cols))
+                                        index=_default_idx("Sample", cols),
+                                        help="Visit/order per subject (1, 2, 3…).")
             with c2:
                 repl_sel = st.selectbox("Replicate",          cols,
-                                        index=_default_idx("Replicate", cols))
+                                        index=_default_idx("Replicate", cols),
+                                        help="Within-sample repeat index (1, 2…).")
                 res_sel  = st.selectbox("Result / value",     cols,
-                                        index=_default_idx("Result", cols))
+                                        index=_default_idx("Result", cols),
+                                        help="Numeric measurement; one unit.")
+            # Single save button (no reset button)
+            confirmed = st.form_submit_button("Save mapping", use_container_width=True)
+            st.caption("To change mapping later, adjust the selections above and click **Save mapping** again.")
 
-            confirmed = st.form_submit_button("Save mapping")
 
         if confirmed:
-            st.session_state.mapped_df = user_df.rename(
-                columns={
-                    subj_sel: "Subject",
-                    samp_sel: "Sample",
-                    repl_sel: "Replicate",
-                    res_sel:  "Result",
-                }
+            mapped_df, errs, warns = _validate_and_build_mapping(
+                user_df, subj_sel, samp_sel, repl_sel, res_sel
             )
-            st.success("Mapping saved – you can now calculate.")
+            if errs:
+                for e in errs:
+                    st.error(e)
+                st.session_state["mapping_ok"] = False
+                st.session_state["mapped_df"] = None
+            else:
+                if warns:
+                    for w in warns:
+                        st.warning(w)
+                st.session_state["mapping_ok"] = True
+                st.session_state["mapped_df"] = mapped_df
+                st.session_state["mapped_source_cols"] = list(user_df.columns)  # NEW
+                st.success("Mapping saved ✓ — columns validated and ready to calculate.")
+                st.caption(f"Preview of mapped columns (first 8 rows):")
+                st.dataframe(mapped_df.head(8), use_container_width=True, hide_index=True)
+
+
+
+    # --- BIVAC QI 1–5 manual entry (appears before Calculate) ---
+    with st.expander("⇢ BIVAC – Manual entry for QI 1–5 (study design & methods)", expanded=False):
+        if "qi_manual" not in st.session_state:
+            st.session_state.qi_manual = {}
+
+        for label, cfg in QI15_CHOICES.items():
+            col1, col2 = st.columns([0.55, 0.45])
+            with col1:
+                st.markdown(f"**{label}**")
+                st.caption(cfg["help"])
+            with col2:
+                choice = st.selectbox(
+                    "Select grade",
+                    options=list(cfg["options"].keys()),
+                    index=0,
+                    format_func=lambda k: f"{k} – {cfg['options'][k]}",
+                    key=f"qi15_{label}",
+                )
+            st.session_state.qi_manual[label] = choice
+
+        # ← ADD THESE TWO LINES HERE
+        same_run = st.checkbox(
+            "Replicates for each subject were analyzed in the same run",
+            value=True,
+            help="BIVAC QI6 demands same-run duplicate analysis for A grade."
+        )
+        st.session_state.qi_manual["QI 6 – same run"] = same_run
+
+        st.info("These selections will be included in the checklist and overall BIVAC grade.")
+
 
     # NEW – user option: CV-ANOVA
     estimate_cv_anova = st.checkbox("Estimate CVI with CV-ANOVA")
     st.session_state["use_cv_anova"] = estimate_cv_anova
 
-    if st.button("Calculate", type="primary"):
+    # NEW: disable Calculate until mapping_ok
+    calc_disabled = not st.session_state.get("mapping_ok", False)
+    if calc_disabled:
+        st.info("Save a valid column mapping above to enable **Calculate**.")
+
+    # CHANGE: add disabled=calc_disabled
+    if st.button("Calculate", type="primary", disabled=calc_disabled):
         try:
             df_for_calc = st.session_state.get("mapped_df")
+            # Keep the extra guard anyway
             if df_for_calc is None:
-                st.warning("Please open “Map / confirm columns” and save a mapping first.")
-                st.stop()                       # abort this run cleanly
+                st.warning("Please open “Map / confirm columns” and save a valid mapping first.")
+                st.stop()
 
             try:
                 res = calculate_bv(
@@ -1549,146 +1884,206 @@ if user_df is not None:
                         log_lines: list[str],
                         res: BVResult,
                         flags: dict[str, bool],
+                        *,
+                        qi_manual: dict[str, str] | None = None,
+                        n_raw: int | None = None,
+                        n_kept: int | None = None
                 ) -> pd.DataFrame:
-                    """
-                    Build a BIVAC v1.1 checklist exactly as defined in Aarsand et al. 2018,
-                    but **only for QI 6‑14** and with 2 new features:
+                    """BIVAC v1.1 checklist (QI 1–14) with Grade, Comment, and Details."""
 
-                    • *Comment*  – short human‑readable explanation of the grade  
-                    • *Details*  – concatenation of **all** log lines relevant to that QI  
-
-                    Critical items (6‑8‑10‑11‑13) still auto‑downgrade to D when they
-                    would otherwise have received C (see Table 1 of the paper).
-                    """
-
-                    # ------------------------------------------------------------------ helpers
-                    def worst(g1, g2):                        # strict min on the A>B>C>D scale
+                    def worst(g1, g2):
                         order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
                         return g1 if order[g1] >= order[g2] else g2
 
-                    # ════════════════════════════════════════════════════════════════════════
-                    # 1.  Grade assessment  (same logic you already had, but no QI 1‑5)
-                    #    ––––– I moved the old logic into a small dict for clarity –––––
-                    # ════════════════════════════════════════════════════════════════════════
-                    grade, comment = {}, {}       # QI ➜ grade / comment (A–D)
+                    # ---------- helpers to mine Details from the preprocessing log ----------
+                    def pick(*keywords):
+                        hits = [l for l in log_lines if all(k.lower() in l.lower() for k in keywords)]
+                        return hits
 
-                    # ---------- QI 6  (replicates / analytical imprecision) -----------------
-                    grade["6"]   = "A" if res.R >= 2 else "C"
-                    comment["6"] = f"{res.R} replicates per sample detected."
-                    # ---------- QI 7  (steady‑state / drift) --------------------------------
-                    drift = any("temporal drift" in l.lower() for l in log_lines)
-                    grade["7"]   = "A"
-                    comment["7"] = "Significant drift subjects removed." if drift else "No drift detected."
-                    # ---------- QI 8  (outlier handling) ------------------------------------
+                    def any_kw(*keywords):
+                        return any(k.lower() in l.lower() for l in log_lines for k in keywords)
+
+                    details = {str(i): [] for i in range(1, 15)}
+                    grade, comment = {}, {}
+
+                    # ---------------- QI 1–5 (manual) ----------------
+                    if qi_manual:
+                        g1 = qi_manual.get("QI 1 – Scale", "A")
+                        g2 = qi_manual.get("QI 2 – Subjects", "A")
+                        g3 = qi_manual.get("QI 3 – Samples", "A")
+                        g4 = qi_manual.get("QI 4 – Measurand/Method", "A")
+                        g5 = qi_manual.get("QI 5 – Preanalytical", "A")
+                        grade.update({"1": g1, "2": g2, "3": g3, "4": g4, "5": g5})
+                        comment.update({
+                            "1": f"User-selected {g1}.",
+                            "2": f"User-selected {g2}.",
+                            "3": f"User-selected {g3}.",
+                            "4": f"User-selected {g4}.",
+                            "5": f"User-selected {g5}."
+                        })
+                        # Details just restate the chosen level (no logs exist for QI1–5)
+                        details["1"].append(f"Manual: Scale → {g1}.")
+                        details["2"].append(f"Manual: Subjects → {g2}.")
+                        details["3"].append(f"Manual: Samples → {g3}.")
+                        details["4"].append(f"Manual: Measurand/Method → {g4}.")
+                        details["5"].append(f"Manual: Preanalytical → {g5}.")
+
+                    # ---------------- QI 6 (analytical imprecision) ----------------
+                    # A requires same-run replicates; if you added the checkbox, we read it here.
+                    same_run = (qi_manual or {}).get("QI 6 – same run", True)
+                    if res.R >= 2 and same_run:
+                        grade["6"] = "A"
+                    elif res.R >= 2:
+                        grade["6"] = "B"
+                    else:
+                        grade["6"] = "C"
+                    comment["6"] = f"{res.R} replicate(s)/sample; {'same run' if same_run else 'different run/unknown'}."
+                    details["6"].extend(pick("QI 6", "imprecision"))
+                    details["6"].extend(pick("replicate", "Cochran"))  # replicate-level outlier cleaning helps explain CVA
+                    details["6"].append(f"CVₐ {res.cv_A:.2f}% (95% CI {res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}%).")
+
+                    # ---------------- QI 7 (steady state / drift) ----------------
+                    drift_checked = flags.get("drift", True)
+                    drift_found = any_kw("temporal drift")
+                    if drift_checked:
+                        grade["7"] = "A"
+                        comment["7"] = "Trend analysis performed; drifting subjects removed." if drift_found else "No drift detected."
+                    else:
+                        grade["7"] = "B"
+                        comment["7"] = "Trend analysis not performed."
+                    details["7"].extend(pick("QI 7", "temporal drift"))
+                    details["7"].extend(pick("Total subjects excluded for drift"))
+                    # if nothing matched, still store something minimal
+                    if not details["7"]:
+                        details["7"].append("No drift messages in log.")
+
+                    # ---------------- QI 8 (outliers) ----------------
                     rep_ok  = flags.get("rep_cochran", True)
                     samp_ok = flags.get("samp_cochran", True)
-                    subj_ok = flags.get("reed",        True)
-
-                    if rep_ok and samp_ok and subj_ok:
-                        grade["8"] = "A"
-                        comment["8"] = "Replicate, sample and subject‑level outlier tests performed."
-                    elif samp_ok and subj_ok:
-                        grade["8"] = "B"
-                        comment["8"] = "Replicate‑level outlier test skipped."
+                    subj_ok = flags.get("reed", True)
+                    if samp_ok and rep_ok and subj_ok:
+                        grade["8"] = "A"; comment["8"] = "Replicate / sample / subject outlier tests performed."
                     elif samp_ok:
-                        grade["8"] = "B"
-                        comment["8"] = "Replicate‑ & subject‑level outlier tests skipped."
+                        grade["8"] = "B"; comment["8"] = "Sample-level outlier test performed; replicate/subject not fully performed."
                     else:
-                        grade["8"] = "C"
-                        comment["8"] = "Only partial outlier testing."
-                    # ---------- QI 9  (normality) ------------------------------------------
-                    transformed = any("log transform applied" in l.lower() for l in log_lines)
-                    grade["9"]   = "A"
-                    comment["9"] = "Log‑transform applied." if transformed else "Gaussian on raw scale."
-                    # ---------- QI 10 (variance homogeneity) -------------------------------
-                    het = any("heterogeneous" in l.lower() for l in log_lines)
-                    if not flags.get("wp_bartlett", True):
-                        grade["10"] = "B"
-                        comment["10"] = "Variance homogeneity test skipped."
+                        grade["8"] = "C"; comment["8"] = "Sample-level outlier analysis not performed."
+                    details["8"].extend(pick("Cochran (replicate"))
+                    details["8"].extend(pick("replicate Cochran outlier removed"))
+                    details["8"].extend(pick("Cochran (Subject"))
+                    details["8"].extend(pick("sample Cochran outlier removed"))
+                    details["8"].extend(pick("Reed mean outlier"))
+                    if not details["8"]:
+                        details["8"].append("No outlier removals recorded.")
+
+                    # ---------------- QI 9 (normality) ----------------
+                    norm_checked = flags.get("normality", True)
+                    if norm_checked:
+                        grade["9"] = "A"
+                        comment["9"] = "Distribution assessed; transform if needed."
                     else:
-                        grade["10"] = "A" if not het else "C"
-                        comment["10"] = "Variances homogeneous." if not het else "Heterogeneous variances."
-                    # ---------- QI 11 (ANOVA model) ----------------------------------------
-                    balanced = res.S == int(res.S) and res.R == int(res.R)
-                    grade["11"]   = "A" if balanced else "B"
-                    comment["11"] = "Balanced nested ANOVA." if balanced else "Method‑of‑moments (unbalanced)."
-                    # ---------- QI 12 (confidence limits) ----------------------------------
-                    grade["12"]   = "A"
-                    comment["12"] = "95 % CIs on CVA/CVI/CVG reported."
-                    # ---------- QI 13 (numbers kept) ---------------------------------------
-                    grade["13"]   = "A"
-                    kept = res.I * res.S * res.R
-                    comment["13"] = f"{kept} results retained after QC."
-                    # ---------- QI 14 (mean concentration) ---------------------------------
-                    grade["14"]   = "A"
-                    comment["14"] = f"Mean concentration {res.grand_mean:.2f}."
+                        grade["9"] = "B"
+                        comment["9"] = "Distribution not assessed."
+                    details["9"].extend(pick("Normality check"))
+                    details["9"].extend(pick("Subject-means Shapiro-Wilk"))
+                    details["9"].extend([l for l in log_lines if "log transform" in l.lower()])
+                    if not details["9"]:
+                        details["9"].append("No normality/transform messages in log.")
 
-                    # ------------------------------------------------------------------ auto‑downgrade critical items to D
-                    for q in ("6", "8", "10", "11", "13"):
-                        if grade[q] == "C":
-                            grade[q] = "D"
-                            comment[q] += "  (critical item downgraded to D)"
+                    # ---------------- QI 10 (variance homogeneity) ----------------
+                    wp_examined = flags.get("wp_bartlett", True)
+                    het = any(("heterogeneous" in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
+                    if wp_examined and not het:
+                        grade["10"] = "A"; comment["10"] = "Variance homogeneity examined; acceptable."
+                    else:
+                        grade["10"] = "C"; comment["10"] = "Variance homogeneity not examined or heterogeneous."
+                    details["10"].extend(pick("QI 10", "Bartlett"))
+                    details["10"].extend(pick("Within-subject Bartlett"))
+                    details["10"].extend(pick("High within-subject variance"))
+                    details["10"].extend(pick("Replicate Bartlett"))
+                    if not details["10"]:
+                        details["10"].append("No variance-homogeneity messages in log.")
 
-                    # ════════════════════════════════════════════════════════════════════════
-                    # 2.  Map preprocessing log → Details column
-                    # ════════════════════════════════════════════════════════════════════════
-                    # simple pattern map: QI ➜ keywords expected in that log line
-                    patterns = {
-                        "6": ("cvₐ", "analytical imprecision"),
-                        "7": ("drift",),
-                        "8": ("outlier",),
-                        "9": ("normality", "log transform"),
-                        "10": ("bartlett", "heterogeneous"),
-                        "11": ("balanced", "unbalanced", "anova"),
-                        "13": ("subject", "sample", "replicate", "results retained"),
-                        "14": ("mean",),
-                        # QI 12 has no explicit log hooks – we’ll leave Details blank
-                    }
+                    # ---------------- QI 11 (statistical method) ----------------
+                    grade["11"] = "A"
+                    if (res.S == int(res.S)) and (res.R == int(res.R)):
+                        comment["11"] = "Nested ANOVA (balanced, closed-form)."
+                        details["11"].append("Balanced crossed design; closed-form variance decomposition.")
+                    else:
+                        comment["11"] = "Variance decomposition on unbalanced data."
+                        details["11"].append("Unbalanced design; method-of-moments variance decomposition.")
 
-                    details = defaultdict(list)
-                    for line in log_lines:
-                        line_l = line.lower()
-                        for q, keys in patterns.items():
-                            if any(k in line_l for k in keys):
-                                details[q].append(line)
+                    # ---------------- QI 12 (confidence limits) ----------------
+                    grade["12"] = "A"
+                    comment["12"] = "95% CIs for CVA/CVI/CVG provided (or computable)."
+                    details["12"].append(
+                        f"CIs present: CVA {res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}%, "
+                        f"CVI {res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}%, "
+                        f"CVG {res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}%."
+                    )
 
-                    # ════════════════════════════════════════════════════════════════════════
-                    # 3.  Assemble DataFrame (QI 6‑14) and overall grade
-                    # ════════════════════════════════════════════════════════════════════════
+                    # ---------------- QI 13 (number of included results) ----------------
+                    if (n_raw is not None) and (n_kept is not None):
+                        n_excl = max(n_raw - n_kept, 0)
+                        grade["13"] = "A"
+                        comment["13"] = f"{n_kept} used / {n_raw} raw (excluded {n_excl})."
+                        details["13"].extend(pick("results retained", "Balanced data set"))
+                        details["13"].append(f"Kept {n_kept} of {n_raw} measurements.")
+                    elif (n_kept is not None):
+                        grade["13"] = "B"
+                        comment["13"] = f"{n_kept} results used (exclusions not documented)."
+                    else:
+                        grade["13"] = "C"
+                        comment["13"] = "Counts not documented."
+
+                    # ---------------- QI 14 (mean concentration) ----------------
+                    grade["14"] = "A"
+                    comment["14"] = f"Mean concentration reported ({res.grand_mean:.2f})."
+                    details["14"].append(f"Mean {res.grand_mean:.2f} "
+                                        f"(95% CI {res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f}).")
+
+                    # assemble rows (add Details column)
                     rows, overall = [], "A"
-                    for q in map(str, range(6, 15)):
+                    for q in map(str, range(1, 15)):
                         overall = worst(overall, grade[q])
                         rows.append(dict(
-                            QI      = f"QI {q}",
-                            Grade   = grade[q],
-                            Comment = comment[q],
-                            Details = " ⏵ ".join(details.get(q, []))          # nice arrow separator
+                            QI=f"QI {q}",
+                            Grade=grade[q],
+                            Comment=comment[q],
+                            Details=" ⏵ ".join(details[q]) if details[q] else ""
                         ))
-
                     df = pd.DataFrame(rows)
                     df.attrs["overall_grade"] = overall
                     return df
 
 
 
-
                 # ── render the checklist & XLSX download ────────────────────────────────────
-                st.subheader("BIVAC Checklist (QI 6 → QI 14)")
+                st.subheader("BIVAC Checklist (QI 1 → QI 14)")
+                # After clean_df is created (you already have this a few lines above)
+                n_raw  = len(df_for_calc)
+                n_kept = len(clean_df)
+
                 bivac_df = _build_qi_checklist(
                     res.preprocess_log,
                     res,
-                    flags = st.session_state["preproc_flags"]
+                    flags=st.session_state["preproc_flags"],
+                    qi_manual=st.session_state.get("qi_manual"),
+                    n_raw=n_raw,
+                    n_kept=n_kept
                 )
 
                 st.dataframe(
-                    bivac_df.style.apply(
-                        lambda s: ["background:#e8f9f0" if g in ("A", "B") else
-                                "background:#fdecea"   for g in s],
-                        axis=1, subset=["Grade"]
-                    ).set_properties(**{"font-size": "0.85rem"}),
+                    bivac_df.style
+                        .apply(
+                            lambda s: ["background:#e8f9f0" if g in ("A", "B") else "background:#fdecea" for g in s],
+                            axis=1, subset=["Grade"]
+                        )
+                        .apply(_style_details_series, subset=["Details"])   # ← NEW
+                        .set_properties(**{"font-size": "0.85rem"}),
                     use_container_width=True,
                     hide_index=True,
                 )
+
                 overall = bivac_df.attrs["overall_grade"]
                 st.markdown(f"**Overall BIVAC grade: {overall}**")
 
@@ -1699,26 +2094,23 @@ if user_df is not None:
 
                     xio = io.BytesIO()
                     with pd.ExcelWriter(xio, engine=engine) as xl:
-                        bivac_df.to_excel(xl, index=False, sheet_name="BIVAC_QI_6-13")
-
+                        bivac_df.to_excel(xl, index=False, sheet_name="BIVAC_QI_1-14")
                     st.download_button(
                         "Excel file",
                         data=xio.getvalue(),
-                        file_name="BIVAC_QI_6-13.xlsx",
-                        mime=(
-                            "application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet"
-                        ),
+                        file_name="BIVAC_QI_1-14.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
 
                 # — Outlier / normality audit trail —
                 with st.expander("Pre-processing log"):
                     if res.preprocess_log:
-                        for line in res.preprocess_log:
-                            st.write("•", line)
+                        # use same alpha you used in analysis (default 0.05)
+                        st.markdown(_render_log_html(res.preprocess_log, alpha=0.05), unsafe_allow_html=True)
                     else:
                         st.write("No outliers detected; data met normality assumptions.")
+
 
             except PreprocessError as e:
                 st.error(e.args[0])                      # friendly headline
