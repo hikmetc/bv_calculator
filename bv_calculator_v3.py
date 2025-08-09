@@ -1585,7 +1585,6 @@ with instr_tab:
             """
 - **“Missing required columns”** → check mapping or rename columns then remap.
 - **“'Sample/Replicate' must be numeric”** → fix non-numeric entries before mapping.
-- **“Normality could not be achieved”** → try enabling log-transform (QI 9) or review outliers.
 - **“All data removed during QC”** → relax switches, or untick **Enforce balanced crossed design**.
             """
         )
