@@ -1024,6 +1024,82 @@ def _cvi_cv_anova_unbalanced(clean_df: pd.DataFrame,
 
     return cvi, ci
 
+def _cvg_ln_balanced(clean_df: pd.DataFrame, alpha: float
+) -> tuple[float, tuple[float, float]]:
+    df = clean_df.copy()
+    if (df["Result"] <= 0).any():
+        raise ValueError("CVG (ln) requires all results > 0.")
+    df["Z"] = np.log(df["Result"])
+
+    I = df["Subject"].nunique()
+    S = df.groupby("Subject")["Sample"].nunique().iloc[0]
+    R = df.groupby(["Subject", "Sample"])["Replicate"].nunique().iloc[0]
+
+    subj_mean = df.groupby("Subject")["Z"].mean()
+    samp_mean = df.groupby(["Subject", "Sample"])["Z"].mean()
+    grand     = df["Z"].mean()
+
+    ss_bp = S*R * ((subj_mean - grand) ** 2).sum()
+    ss_wp = R   * ((samp_mean - samp_mean.index.get_level_values(0).map(subj_mean)) ** 2).sum()
+
+    df_bp = I - 1
+    df_wp = I * (S - 1)
+
+    ms_bp = ss_bp / df_bp
+    ms_wp = ss_wp / df_wp
+
+    var_bp_ln = max((ms_bp - ms_wp) / (S * R), 0.0)
+    cvg       = float(np.sqrt(np.exp(var_bp_ln) - 1.0) * 100)
+
+    ms_lo = (df_bp * ms_bp) / chi2.ppf(1 - alpha/2, df_bp)
+    ms_hi = (df_bp * ms_bp) / chi2.ppf(alpha/2,     df_bp)
+
+    var_lo = max((ms_lo - ms_wp) / (S * R), 0.0)
+    var_hi = max((ms_hi - ms_wp) / (S * R), 0.0)
+
+    ci = (float(np.sqrt(np.exp(var_lo) - 1.0) * 100),
+          float(np.sqrt(np.exp(var_hi) - 1.0) * 100))
+    return cvg, ci
+
+
+def _cvg_ln_unbalanced(clean_df: pd.DataFrame, alpha: float
+) -> tuple[float, tuple[float, float]]:
+    df = clean_df.copy()
+    if (df["Result"] <= 0).any():
+        raise ValueError("CVG (ln) requires all results > 0.")
+    df["Z"] = np.log(df["Result"])
+
+    I    = df["Subject"].nunique()
+    S_i  = df.groupby("Subject")["Sample"].nunique()
+    r_ij = df.groupby(["Subject","Sample"])["Replicate"].nunique()
+    n_i  = r_ij.groupby("Subject").sum()
+    nbar = float(n_i.mean())                 # = S̄·r̄
+
+    subj_mean = df.groupby("Subject")["Z"].mean()
+    samp_mean = df.groupby(["Subject","Sample"])["Z"].mean()
+    grand     = df["Z"].mean()
+
+    ss_bp = (n_i * (subj_mean - grand)**2).sum()
+    ss_wp = ((samp_mean - samp_mean.index.get_level_values(0).map(subj_mean))**2 * r_ij).sum()
+
+    df_bp = I - 1
+    df_wp = (S_i - 1).sum()
+
+    ms_bp = ss_bp / df_bp
+    ms_wp = ss_wp / df_wp
+
+    var_bp_ln = max((ms_bp - ms_wp) / nbar, 0.0)
+    cvg       = float(np.sqrt(np.exp(var_bp_ln) - 1.0) * 100)
+
+    ms_lo = (df_bp * ms_bp) / chi2.ppf(1 - alpha/2, df_bp)
+    ms_hi = (df_bp * ms_bp) / chi2.ppf(alpha/2,     df_bp)
+
+    var_lo = max((ms_lo - ms_wp) / nbar, 0.0)
+    var_hi = max((ms_hi - ms_wp) / nbar, 0.0)
+
+    ci = (float(np.sqrt(np.exp(var_lo) - 1.0) * 100),
+          float(np.sqrt(np.exp(var_hi) - 1.0) * 100))
+    return cvg, ci
 
 # ——— helper for the unbalanced branch ——————————————————————————————
 def _calculate_bv_unbalanced(df: pd.DataFrame,
@@ -1080,9 +1156,11 @@ def _calculate_bv_unbalanced(df: pd.DataFrame,
                np.sqrt(var_A*df_a/chi.ppf(0.025, df_a))/grand*100)
     ci_cv_I = (np.sqrt(max(( (df_wp*ms_wp/chi.ppf(0.975,df_wp))-var_A)/r_bar,0))/grand*100,
                np.sqrt(max(( (df_wp*ms_wp/chi.ppf(0.025,df_wp))-var_A)/r_bar,0))/grand*100)
-    ci_cv_G = (np.sqrt(max(( (df_bp*(ms_bp-ms_wp)/chi.ppf(0.975,df_bp)))/(S_bar*r_bar),0))/grand*100,
-               np.sqrt(max(( (df_bp*(ms_bp-ms_wp)/chi.ppf(0.025,df_bp)))/(S_bar*r_bar),0))/grand*100)
 
+    cvg_ln, ci_cvg_ln = _cvg_ln_unbalanced(df, alpha)
+    cv_G     = cvg_ln
+    ci_cv_G  = ci_cvg_ln
+                               
     rcv = 1.96*np.sqrt(2)*np.sqrt(cv_A**2 + cv_I**2)
 
     return dict(var_A=var_A, var_WP=var_WP, var_BP=var_BP,
@@ -1278,24 +1356,9 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
         )
 
         # — 3.10 exact 95 % CI for CV_G (between-subject) ——
-        df_bp = I - 1
-        chi2_low_bp = chi2.ppf(alpha/2, df_bp)
-        chi2_up_bp  = chi2.ppf(1 - alpha/2, df_bp)
-
-        # MS_BP contains σ²_A + Rσ²_WP + SRσ²_BP; subtract lower levels first
-        adj_ms_bp = ms_bp - ms_wp
-
-        ms_bp_lower = (df_bp * adj_ms_bp) / chi2_up_bp
-        ms_bp_upper = (df_bp * adj_ms_bp) / chi2_low_bp
-
-        # convert MS limits to σ²_BP limits: MS_limit / (S*R)
-        ci_var_bp_low = max(ms_bp_lower / (S * R), 0.0)
-        ci_var_bp_up  = max(ms_bp_upper / (S * R), 0.0)
-
-        ci_cv_G = (
-            np.sqrt(ci_var_bp_low) / grand * 100,
-            np.sqrt(ci_var_bp_up)  / grand * 100,
-        )
+        # --- CVG: ln-ANOVA + back-transform ---
+        cv_G, ci_cv_G = _cvg_ln_balanced(df, alpha)
+        pp_log.append("CVG estimated on ln scale and back-transformed.")
 
         # 3.11 reference‑change value (two‑sided, 95 %)
         rcv = 1.96 * np.sqrt(2) * np.sqrt(cv_A**2 + cv_I**2)
