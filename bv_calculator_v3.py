@@ -146,7 +146,9 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
+# ---- Always define these so later guards don't crash ----
+user_df: pd.DataFrame | None = None
+up_file = None
 
 # --- BIVAC QI 1–5 definitions (Aarsand 2018 Table 1) ---
 QI15_CHOICES = {
@@ -1576,7 +1578,7 @@ with st.sidebar:
 
 
 # 6.3 tabs – add an Instructions tab
-instr_tab, upload_tab, entry_tab = st.tabs(["Instructions", "Upload", "Manual Entry"])
+instr_tab, upload_tab, entry_tab = st.tabs(["**Instructions**", "**Upload**", "**Manual Entry**"])
 
 with instr_tab:
     st.subheader("How this app works (quick guide)")
@@ -1654,15 +1656,13 @@ with instr_tab:
     st.caption("Tip: You can also download the template from the sidebar.")
 
 
-# NEW ▸ make sure the variable always exists
-user_df: pd.DataFrame | None = None
-# NEW: Invalidate saved mapping if the incoming dataframe's columns changed
-if user_df is not None:
-    prev_cols = st.session_state.get("mapped_source_cols")
-    if prev_cols is None or list(prev_cols) != list(user_df.columns):
-        st.session_state["mapping_ok"] = False
-        st.session_state["mapped_df"] = None
-        st.session_state["mapped_source_cols"] = list(user_df.columns)
+
+
+
+
+
+
+
 
 # -- Tab 1: Upload -----------------------------------------------------------
 with upload_tab:
@@ -1696,10 +1696,45 @@ with entry_tab:
         use_container_width=True,
         key="editor",
     )
-    if manual_df.dropna().shape[0] >= 4:
+    ready = manual_df.dropna().shape[0] >= 4
+    if ready:
         user_df = _strip_ghost_index(manual_df.copy())
-    # save edits back to session
+    # do not touch user_df otherwise; just persist edits:
     st.session_state.manual_df = manual_df
+
+
+# ---- Dataset identity & remap guard ----------------------------------------
+def _dataset_origin(up_file, df):
+    if up_file is not None:
+        # include filename to detect replacement with a different upload
+        return f"upload::{up_file.name}"
+    if df is not None:
+        return "manual"
+    return None
+
+curr_origin = _dataset_origin(up_file, user_df)
+curr_cols   = tuple(map(str, user_df.columns)) if user_df is not None else None
+curr_rows   = int(len(user_df)) if user_df is not None else None
+
+prev_origin = st.session_state.get("data_origin")
+prev_cols   = st.session_state.get("data_cols")
+prev_rows   = st.session_state.get("data_rows")
+
+# Invalidate saved mapping if:
+#  • source changed (upload ↔ manual, or different file name)
+#  • columns changed (headers remapped)
+#  • dataset cleared (user removed file → origin becomes None)
+#  • row count changed (likely a different upload with same headers)
+if (curr_origin != prev_origin) or (curr_cols != prev_cols) or (curr_rows != prev_rows):
+    st.session_state["mapping_ok"] = False
+    st.session_state["mapped_df"] = None
+    st.session_state["mapped_source_cols"] = list(user_df.columns) if user_df is not None else None
+
+# Persist current fingerprint for next run
+st.session_state["data_origin"] = curr_origin
+st.session_state["data_cols"]   = curr_cols
+st.session_state["data_rows"]   = curr_rows
+# ---------------------------------------------------------------------------
 
 # NEW: persistent mapping state gate
 if "mapping_ok" not in st.session_state:
