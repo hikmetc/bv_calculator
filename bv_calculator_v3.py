@@ -1840,6 +1840,7 @@ if user_df is not None:
         st.session_state.qi_manual["QI 6 – same run"] = same_run
 
         st.info("These selections will be included in the checklist and overall BIVAC grade.")
+        st.info("When using BIVAC, please cite the following reference: Aarsand AK, Røraas T, Fernandez-Calle P, Ricos C, Díaz-Garzón J, Jonker N, Perich C, González-Lao E, Carobene A, Minchinela J, Coşkun A, Simón M, Álvarez V, Bartlett WA, Fernández-Fernández P, Boned B, Braga F, Corte Z, Aslan B, Sandberg S; European Federation of Clinical Chemistry and Laboratory Medicine Working Group on Biological Variation and Task and Finish Group for the Biological Variation Database. The Biological Variation Data Critical Appraisal Checklist: A Standard for Evaluating Studies on Biological Variation. Clin Chem. 2018 Mar;64(3):501-514. doi: 10.1373/clinchem.2017.281808. Epub 2017 Dec 8. PMID: 29222339.")
 
 
     # NEW – user option: CV-ANOVA
