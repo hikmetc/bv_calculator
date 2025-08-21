@@ -153,7 +153,7 @@ up_file = None
 # --- BIVAC QI 1–5 definitions (Aarsand 2018 Table 1) ---
 QI15_CHOICES = {
     "QI 1 – Scale": {
-        "help": "Is the measurand given on a ratio scale?",
+        "help": " Is the analyte expressed on a ratio scale?",
         "options": {
             "A": "Yes (ratio scale)",
             "B": "No (non-ratio scale)",
@@ -169,7 +169,7 @@ QI15_CHOICES = {
         },
     },
     "QI 3 – Samples": {
-        "help": "Documented: (a) #samples; (b) sample material; (c) timing; (d) study length.",
+        "help": "Are these aspects recorded? (a) Count of collected samples; (b) Specimen type used; (c) Collection timing; (d) Study duration",
         "options": {
             "A": "Yes (a,b,c,d) documented",
             "B": "(a,c,d) documented; (b) insufficient but not important",
