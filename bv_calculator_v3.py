@@ -1391,77 +1391,6 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             ci_cv_I_cv_anova = ci_cv_anova,
         )
 
-# Calculate per-subject CV_P using all replicates
-def compute_cvp_per_subject_all_reps(
-    clean_df: pd.DataFrame,
-    var_A: float,
-    *,
-    alpha: float = 0.05
-) -> pd.DataFrame:
-    """
-    Per-subject within-person BV (CV_P) using ALL replicates.
-
-    For each subject i:
-      1) Take per-visit replicate MEANS M_ij and replicate counts r_ij
-      2) s²_means = Var_j(M_ij)   across that subject's visits
-      3) A_eff = σ²_A · mean_j(1 / r_ij)   (analytical variance of the visit means)
-      4) σ²_P(i) = max( s²_means − A_eff, 0 )
-      5) CV_P(i) = 100 · sqrt(σ²_P(i)) / mean(M_ij)
-      6) CI via χ² on s²_means with df = S_i − 1, then subtract A_eff and back-transform
-
-    Notes:
-      • Works for balanced and unbalanced data (r_ij can vary).
-      • Requires ≥3 visits for a CI; with fewer, CV_P is NaN.
-    """
-    rows = []
-    for subj, g in clean_df.groupby("Subject"):
-        per_sample = (g.groupby("Sample")
-                        .agg(mean=("Result", "mean"),
-                             r=("Replicate", "nunique"))
-                        .sort_index())
-
-        S_i = len(per_sample)
-        mean_i = float(per_sample["mean"].mean()) if S_i else np.nan
-
-        if S_i < 3 or not np.isfinite(mean_i) or mean_i <= 0:
-            rows.append(dict(
-                Subject=subj, n_samples=S_i, Mean=mean_i,
-                s2_means=np.nan, A_eff=np.nan,
-                CVP_percent=np.nan, CI_low=np.nan, CI_high=np.nan,
-                note="Need ≥3 samples"
-            ))
-            continue
-
-        s2_means = float(np.var(per_sample["mean"].values, ddof=1))   # across visits
-        A_eff = float(var_A * (1.0 / per_sample["r"].values).mean())  # avg σ²_A/r_ij
-
-        var_P = max(s2_means - A_eff, 0.0)
-
-        df = S_i - 1
-        chi_lo = chi2.ppf(alpha/2,     df)
-        chi_hi = chi2.ppf(1 - alpha/2, df)
-
-        # χ² limits on s²_means, then subtract A_eff (truncate at 0)
-        s2_lo = (df * s2_means) / chi_hi
-        s2_hi = (df * s2_means) / chi_lo
-        var_lo = max(s2_lo - A_eff, 0.0)
-        var_hi = max(s2_hi - A_eff, 0.0)
-
-        cvp     = (np.sqrt(var_P)   / mean_i) * 100.0
-        cvp_lo  = (np.sqrt(var_lo)  / mean_i) * 100.0
-        cvp_hi  = (np.sqrt(var_hi)  / mean_i) * 100.0
-
-        rows.append(dict(
-            Subject=subj, n_samples=S_i, Mean=mean_i,
-            s2_means=s2_means, A_eff=A_eff,
-            CVP_percent=cvp, CI_low=cvp_lo, CI_high=cvp_hi,
-            note="OK"
-        ))
-
-    out = (pd.DataFrame(rows)
-             .sort_values("Subject")
-             .reset_index(drop=True))
-    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Beautiful per-subject mean ± range (min–max) plot
@@ -2039,59 +1968,6 @@ if user_df is not None:
                 )
                 st.subheader("Per-subject distribution")
                 st.plotly_chart(plot_subject_ranges(clean_df), use_container_width=True)
-
-
-                # === Within-person BV (CVP) per subject — refined table ===
-                st.subheader("Within-person biological variation per subject (CV\u209A)")
-
-                cvp_tbl = compute_cvp_per_subject_all_reps(
-                    clean_df,
-                    var_A=res.var_A,
-                    alpha=0.05
-                )
-
-                # keep only rows where CVP is available (≥3 samples/subject)
-                mask = cvp_tbl["CVP_percent"].notna()
-                ci_str = (
-                    cvp_tbl.loc[mask, "CI_low"].map(lambda v: f"{v:.2f}") + "–" +
-                    cvp_tbl.loc[mask, "CI_high"].map(lambda v: f"{v:.2f}")
-                )
-
-                # ⬅️ include n_samples; rename for display
-                cvp_tidy = (
-                    cvp_tbl.loc[mask, ["Subject", "n_samples", "Mean", "CVP_percent"]]
-                            .rename(columns={
-                                "n_samples": "Samples included",
-                                "CVP_percent": "CVP (%)"
-                            })
-                            .assign(**{"95% CI": ci_str})
-                            .sort_values("Subject")
-                            .reset_index(drop=True)
-                )
-
-                # Make sure it renders as an integer column
-                cvp_tidy["Samples included"] = cvp_tidy["Samples included"].astype(int)
-
-                st.dataframe(
-                    cvp_tidy.style.format({
-                        "Samples included": "{:d}",
-                        "Mean": "{:.3f}",
-                        "CVP (%)": "{:.2f}",
-                    }),
-                    use_container_width=True, hide_index=True
-                )
-
-                with st.expander("⇢ Download per-subject CV\u209A table"):
-                    xio = io.BytesIO()
-                    with pd.ExcelWriter(xio, engine="openpyxl") as xl:
-                        cvp_tidy.to_excel(xl, index=False, sheet_name="CVP_by_subject_refined")
-                    st.download_button(
-                        "Excel file",
-                        data=xio.getvalue(),
-                        file_name="per_subject_CVP_refined.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
 
 
                 # ---------------------------------------------------------------------------
