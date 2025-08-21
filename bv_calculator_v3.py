@@ -191,8 +191,7 @@ QI15_CHOICES = {
         "options": {
             "A": "Yes (adequate)",
             "B": "Insufficient detail (unlikely important)",
-            "C": "Insufficient detail (may be important)",
-            "D": "No details provided",
+            "C": "Insufficient detail (may be important) or No details provided",
         },
     },
 }
