@@ -1465,7 +1465,7 @@ def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
         ),
         font=dict(size=11),
         title=dict(
-            text="Per-subject mean ± range",
+            text="Per-subject mean (range)",
             x=0.5, xanchor="center",
             font=dict(size=14, color="#2a3f5f")
         ),
@@ -1876,26 +1876,26 @@ if user_df is not None:
 
                 # --- build the metrics list ---
                 metrics = [
-                    ("Mean",
+                    ("Mean (CI)",
                     f"{res.grand_mean:.2f}",
-                    f"{res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f} CI"),
-                    ("CV<sub>A</sub>",
-                    f"{res.cv_A:.2f} %",
-                    f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}% CI"),
-                    ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span>",
-                        f"{res.cv_I:.2f} %",
-                        f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}% CI"),
-                    ("CV<sub>G</sub>",  f"{res.cv_G:.2f} %",
-                        f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}% CI"),
-                    ("95 % RCV",        f"±{res.rcv_95:.2f} %",                                    None),
+                    f"({res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f})"),
+                    ("CV<sub>A</sub> (CI%)",
+                    f"{res.cv_A:.2f}",
+                    f"({res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f})"),
+                    ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span> (CI%)",
+                        f"{res.cv_I:.2f}",
+                        f"({res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f})"),
+                    ("CV<sub>G</sub> (CI%)",  f"{res.cv_G:.2f}",
+                        f"({res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f})"),
+                    ("RCV (95%)",        f"±{res.rcv_95:.2f}",                                    None),
                 ]
 
                 # append the optional CV-ANOVA metric as *last* element
                 if res.cv_I_cv_anova is not None:
                     metrics.append((
-                        "CV<sub>I</sub> <span style='font-size:0.75em;'>(based on CV-ANOVA)</span>",
-                        f"{res.cv_I_cv_anova:.2f} %",
-                        f"{res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f}% CI"
+                        "CV<sub>I</sub> <span style='font-size:0.75em;'>(based on CV-ANOVA)</span> (CI%)",
+                        f"{res.cv_I_cv_anova:.2f}",
+                        f"({res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f})"
                     ))
 
                 # --- split into rows ------------------------------------------------------
@@ -1937,12 +1937,12 @@ if user_df is not None:
                 st.write(" ")
                 st.subheader("Summary of variation metrics")
                 var_tbl = pd.DataFrame({
-                    "Component": ["Analytical", "Within‑subject", "Between‑subject"],
+                    "Variations": ["Analytical", "Within‑subject", "Between‑subject"],
                     "Variance":  [res.var_A,    res.var_WP,      res.var_BP],
                     "CV %":      [res.cv_A,     res.cv_I,        res.cv_G],
-                    "95 % CI":   [f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f} %",
-                                f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f} %",
-                                f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f} %"],
+                    "CI (95%)":   [f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}",
+                                f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}",
+                                f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}"],
                 })
 
                 st.dataframe(
