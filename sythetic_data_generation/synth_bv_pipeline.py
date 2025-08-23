@@ -1,176 +1,235 @@
-# synth_bv_pipeline.py
-# Reproduce the final synthetic dataset (see comments for steps).
-# Requirements: pandas, numpy, openpyxl, xlsxwriter
+"""
+Synthetic BV generator using ONLY user-input features (no file I/O).
+Data will change depending on seed value.
+Model:
+  Y_isr = mu + B_i + W_is + A_isr
+  B_i   ~ N(0, var_BP)         # between-subject
+  W_is  ~ N(0, var_WP)         # within-subject (sample-level)
+  A_isr ~ N(0, var_A)          # replicate/analytical
 
-import io
-import os
-import re
+You provide:
+  • mu, var_A, var_WP, var_BP  (from your original study)
+  • a grid: balanced I×S×R   (or pass a custom grid DataFrame)
+  • (optional) scale targets (mean/sd or min/max), rounding decimals, positivity clip
+
+Outputs a pandas DataFrame with new synthetic "Result" values.
+"""
+
+from __future__ import annotations
+import math
 import numpy as np
 import pandas as pd
+from typing import Optional, Literal
 
-# --------------------------- utilities ---------------------------
+# ----------------------------- grid helpers -----------------------------
 
-def normalize(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+def make_balanced_grid(I: int, S: int, R: int, subject_prefix: str = "P") -> pd.DataFrame:
+    """Balanced Subject×Sample×Replicate grid."""
+    rows = []
+    for i in range(1, I + 1):
+        subj = f"{subject_prefix}{i:02d}"
+        for s in range(1, S + 1):
+            for r in range(1, R + 1):
+                rows.append((subj, s, r))
+    return pd.DataFrame(rows, columns=["Subject", "Sample", "Replicate"])
 
-def find_flexible(columns, candidates):
-    cand_norm = [normalize(c) for c in candidates]
-    for c in columns:                      # exact normalized match
-        if normalize(c) in cand_norm:
-            return c
-    for c in columns:                      # substring match
-        cn = normalize(c)
-        if any(tok in cn for tok in cand_norm):
-            return c
-    return None
+def normalize_grid(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure grid has exactly ['Subject','Sample','Replicate'] with Subject=str, Sample=int, Replicate=int."""
+    need = {"Subject","Sample","Replicate"}
+    if not need.issubset(df.columns):
+        raise KeyError("Custom grid must have columns: Subject, Sample, Replicate")
+    out = df.loc[:, ["Subject","Sample","Replicate"]].copy()
+    out["Subject"]   = out["Subject"].astype(str)
+    out["Sample"]    = pd.to_numeric(out["Sample"], errors="raise").astype(int)
+    out["Replicate"] = pd.to_numeric(out["Replicate"], errors="raise").astype(int)
+    return out.reset_index(drop=True)
 
-def detect_cols(df: pd.DataFrame):
-    subj = find_flexible(df.columns, ["subject", "sunject", "participant", "patient", "id", "subjectid", "sunjectid"])
-    samp = find_flexible(df.columns, ["sample", "time", "visit", "sampleid"])
-    repl = find_flexible(df.columns, ["replicate", "rep", "replicateid", "repno"])
-    res  = find_flexible(df.columns, ["result", "results", "value", "measurement"])
-    if not all([subj, samp, repl, res]):
-        missing = ["Subject","Sample","Replicate","Result"]
-        have = {subj:"Subject", samp:"Sample", repl:"Replicate", res:"Result"}
-        have_str = ", ".join([v for k,v in have.items() if k])
-        raise KeyError(f"Could not detect all columns. Found: {have_str}. Needed: {', '.join(missing)}")
-    df = df.rename(columns={subj:"Subject", samp:"Sample", repl:"Replicate", res:"Result"})
-    return df[["Subject","Sample","Replicate","Result"]].copy()
+# ------------------------ variance tools (optional) ---------------------
 
-def strip_ghost_index(df: pd.DataFrame) -> pd.DataFrame:
-    if not df.empty and (df.columns[0] == "" or str(df.columns[0]).startswith("Unnamed")):
-        return df.iloc[:,1:].copy()
-    return df
+def _rescale_to_variance(x: np.ndarray, target_var: float) -> np.ndarray:
+    """Rescale centered vector x so sample variance ≈ target_var."""
+    x = np.asarray(x, dtype=float)
+    if target_var <= 0 or x.size < 2:
+        return np.zeros_like(x)
+    xc = x - x.mean()
+    cur = float(xc.var(ddof=1)) if xc.size > 1 else 0.0
+    if cur <= 0:
+        return np.random.normal(0.0, math.sqrt(target_var), size=x.size)
+    return xc * math.sqrt(max(target_var,0.0) / cur)
 
-def integer_like(series: pd.Series) -> bool:
-    vals = pd.to_numeric(series.dropna(), errors="coerce")
-    return vals.notna().all() and np.allclose(vals.values, np.rint(vals.values), atol=1e-9)
-
-# ------------------- step 1: change per-group distributions -------------------
-
-def change_results_per_group(df: pd.DataFrame, rng_seed: int = 12345) -> pd.Series:
+def estimate_components_unbalanced(df: pd.DataFrame):
     """
-    Stratify by Subject×Sample×Replicate and replace only Result values:
-      - Numeric: perturb mean & SD per group, sample Normal(new_mu, new_sigma),
-                 clip to global range with ±10% margin.
-      - Categorical: sample from a Dirichlet-perturbed category distribution.
+    Quick check of realized components from synthetic data (no files needed).
+    Returns (grand, var_A, var_WP, var_BP).
     """
-    np.random.seed(rng_seed)
-    orig = df["Result"]
-    mask = orig.isna()
+    df = df.rename(columns=str.title)
+    subj_mean = df.groupby("Subject")["Result"].mean()
+    samp_mean = df.groupby(["Subject","Sample"])["Result"].mean()
+    grand     = df["Result"].mean()
 
-    coerced = pd.to_numeric(orig, errors="coerce")
-    numeric_share = coerced.notna().mean()
+    r_ij = df.groupby(["Subject","Sample"])["Replicate"].nunique()
+    S_i  = df.groupby("Subject")["Sample"].nunique()
 
-    global_nonnull = coerced[coerced.notna()]
-    global_min = float(global_nonnull.min()) if not global_nonnull.empty else -np.inf
-    global_max = float(global_nonnull.max()) if not global_nonnull.empty else  np.inf
-    global_std = float(global_nonnull.std(ddof=0)) if not global_nonnull.empty else 1.0
-    rng = global_max - global_min if np.isfinite(global_max) and np.isfinite(global_min) else None
+    r_bar = r_ij.mean()
+    S_bar = S_i.mean()
 
-    new_series = orig.copy()
+    ss_bp = ((samp_mean.index.get_level_values(0).map(subj_mean) - grand)**2 * r_ij).groupby(level=0).sum().sum()
+    ss_wp = ((samp_mean - samp_mean.index.get_level_values(0).map(subj_mean))**2 * r_ij).sum()
+    ss_a  = ((df["Result"] - samp_mean.loc[list(zip(df["Subject"], df["Sample"]))].values)**2).sum()
 
-    for _, idx in df.groupby(["Subject","Sample","Replicate"], dropna=False).indices.items():
-        idx = pd.Index(idx)
-        idx_nonnull = idx[~mask.loc[idx]]
-        if len(idx_nonnull) == 0: 
-            continue
+    I    = max(subj_mean.size, 1)
+    df_bp = max(I - 1, 1)
+    df_wp = max((S_i - 1).sum(), 1)
+    df_a  = max((r_ij - 1).sum(), 1)
 
-        if numeric_share >= 0.8:
-            g = coerced.loc[idx_nonnull]
-            mu = float(g.mean()); sigma = float(g.std(ddof=0))
-            base_std = sigma if (np.isfinite(sigma) and sigma > 0) else (global_std if (np.isfinite(global_std) and global_std > 0) else 1.0)
-            shift = np.random.uniform(-0.75, 0.75) * base_std
-            scale = np.random.uniform(0.6, 1.8)
-            new_mu = mu + shift
-            new_sigma = max(1e-9, base_std * scale)
-            samples = np.random.normal(loc=new_mu, scale=new_sigma, size=len(idx_nonnull))
-            if rng is not None and np.isfinite(rng) and rng > 0:
-                lo = global_min - 0.1*rng; hi = global_max + 0.1*rng
-                samples = np.clip(samples, lo, hi)
-            new_series.loc[idx_nonnull] = samples
+    ms_bp = ss_bp / df_bp
+    ms_wp = ss_wp / df_wp
+    ms_a  = ss_a  / df_a
+
+    var_A  = ms_a
+    var_WP = max((ms_wp - ms_a) / max(r_bar, 1), 0.0)
+    var_BP = max((ms_bp - ms_wp) / max(S_bar * r_bar, 1), 0.0)
+
+    return float(grand), float(var_A), float(var_WP), float(var_BP)
+
+# ----------------------------- core simulator -----------------------------
+
+def simulate_bv_from_features(
+    *,
+    mu: float,
+    var_A: float,
+    var_WP: float,
+    var_BP: float,
+    grid: Optional[pd.DataFrame] = None,
+    I: Optional[int] = None,
+    S: Optional[int] = None,
+    R: Optional[int] = None,
+    seed: Optional[int] = 1234,
+    enforce_exact_component_vars: bool = True,
+    # scale/format knobs (all user-provided, no files)
+    scale_mode: Literal["none","mean_sd","minmax"] = "none",
+    ref_mean: Optional[float] = None,
+    ref_sd:   Optional[float] = None,
+    ref_min:  Optional[float] = None,
+    ref_max:  Optional[float] = None,
+    clip_nonnegative: bool = False,
+    rounding_decimals: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Generate synthetic BV data from user-supplied features ONLY.
+
+    - Provide either a custom 'grid' OR a balanced grid via I,S,R.
+    - Optionally match scale to your known mean/sd or min/max, and rounding.
+    """
+    rng = np.random.default_rng(seed)
+
+    # 1) Build/validate grid
+    if grid is None:
+        if None in (I,S,R):
+            raise ValueError("Provide a custom 'grid' OR all of I, S, R for a balanced grid.")
+        df = make_balanced_grid(I,S,R)
+    else:
+        df = normalize_grid(grid)
+
+    # 2) Random effects
+    subjects = df["Subject"].unique().tolist()
+    ss_index = pd.MultiIndex.from_frame(df[["Subject","Sample"]]).drop_duplicates()
+
+    B = pd.Series(rng.normal(0.0, math.sqrt(max(var_BP,0.0)), size=len(subjects)), index=subjects)
+    W = pd.Series(rng.normal(0.0, math.sqrt(max(var_WP,0.0)), size=len(ss_index)), index=ss_index)
+    A = pd.Series(rng.normal(0.0, math.sqrt(max(var_A,0.0)),  size=len(df)),        index=df.index)
+
+    # 3) Optionally force realized component variances ≈ targets
+    if enforce_exact_component_vars:
+        if len(B)>1: B = pd.Series(_rescale_to_variance(B.values, var_BP), index=B.index)
+        if len(W)>1: W = pd.Series(_rescale_to_variance(W.values, var_WP), index=W.index)
+        if len(A)>1: A = pd.Series(_rescale_to_variance(A.values, var_A),  index=A.index)
+
+    # 4) Compose Y = mu + B_i + W_is + A_isr
+    y = (
+        mu
+        + df["Subject"].map(B).to_numpy()
+        + W.loc[pd.MultiIndex.from_arrays([df["Subject"].values, df["Sample"].values])].to_numpy()
+        + A.to_numpy()
+    )
+    out = df.copy()
+    out["Result"] = y.astype(float)
+
+    # 5) Optional scale matching (all inputs come from the user)
+    if scale_mode == "mean_sd":
+        if ref_mean is None or ref_sd is None:
+            raise ValueError("scale_mode='mean_sd' requires ref_mean and ref_sd.")
+        cur_m = float(out["Result"].mean())
+        cur_s = float(out["Result"].std(ddof=1)) if len(out)>1 else 0.0
+        if cur_s > 0:
+            out["Result"] = (out["Result"] - cur_m) * (ref_sd/cur_s) + ref_mean
         else:
-            g = orig.loc[idx_nonnull]
-            counts = g.value_counts(dropna=True)
-            alpha = counts.values.astype(float) + 0.5
-            p = np.random.dirichlet(alpha)
-            cats = counts.index.tolist()
-            new_series.loc[idx_nonnull] = np.random.choice(cats, size=len(idx_nonnull), p=p)
+            out["Result"] = ref_mean
+    elif scale_mode == "minmax":
+        if ref_min is None or ref_max is None or ref_max <= ref_min:
+            raise ValueError("scale_mode='minmax' requires valid ref_min < ref_max.")
+        cur_min, cur_max = float(out["Result"].min()), float(out["Result"].max())
+        if cur_max > cur_min:
+            scale = (ref_max - ref_min) / (cur_max - cur_min)
+            out["Result"] = (out["Result"] - cur_min) * scale + ref_min
 
-    return new_series
+    # 6) Optional clipping & rounding
+    if clip_nonnegative:
+        out["Result"] = out["Result"].clip(lower=0.0)
+    if isinstance(rounding_decimals, int):
+        out["Result"] = out["Result"].round(rounding_decimals)
 
-# --------------------- step 2/3: rounding & variance shrink -------------------
-
-def round_1dp(s: pd.Series) -> pd.Series:
-    num = pd.to_numeric(s, errors="coerce").round(1)
-    out = num.astype(float)
-    # if original had non-numeric strings, preserve them
-    nonnum_mask = pd.to_numeric(s, errors="coerce").isna() & s.notna()
-    out.loc[nonnum_mask] = s.loc[nonnum_mask]
     return out
 
-def shrink_within_subject_sample(df: pd.DataFrame, alpha: float) -> pd.Series:
-    """
-    Shrink deviations from the Subject×Sample mean by factor alpha (0<alpha<1):
-       new = mean + alpha * (old - mean)
-    """
-    orig = df["Result"]
-    num = pd.to_numeric(orig, errors="coerce")
-    out = orig.copy()
-
-    for (_, _), idx in df.groupby(["Subject","Sample"], dropna=False).indices.items():
-        idx = pd.Index(idx)
-        msk = num.loc[idx].notna()
-        if not msk.any(): 
-            continue
-        sub_idx = idx[msk.values]
-        gmean = num.loc[sub_idx].mean()
-        out.loc[sub_idx] = gmean + alpha * (num.loc[sub_idx] - gmean)
-
-    return round_1dp(out)
-
-# --------------------------- main pipeline function ---------------------------
-
-def generate_final_synthetic(in_path: str, out_path: str):
-    # read CSV/XLSX
-    _, ext = os.path.splitext(in_path.lower())
-    if ext == ".xlsx":
-        df = pd.read_excel(in_path)
-    elif ext == ".csv":
-        df = pd.read_csv(in_path)
-    else:
-        raise ValueError("Input must be .csv or .xlsx")
-
-    df = strip_ghost_index(df)
-    df = detect_cols(df)  # map to Subject, Sample, Replicate, Result
-
-    # STEP 1: change per-group distributions (Subject×Sample×Replicate)
-    df["Result"] = change_results_per_group(df, rng_seed=12345)
-
-    # STEP 2: round to exactly 1 decimal
-    df["Result"] = round_1dp(df["Result"])
-
-    # STEP 3a: reduce replicate-based variance by ~30% (alpha=0.7)
-    df["Result"] = shrink_within_subject_sample(df, alpha=0.7)  # keeps 1 dp
-
-    # STEP 3b: additional 50% reduction (alpha=0.5) on the current values
-    df["Result"] = shrink_within_subject_sample(df, alpha=0.5)  # keeps 1 dp
-
-    # write Excel with column formatting = one decimal
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, sheet_name="Sheet1", index=False)
-        ws = writer.sheets["Sheet1"]
-        # apply number format to the Result column
-        res_col_idx = df.columns.get_loc("Result")
-        fmt = writer.book.add_format({"num_format": "0.0"})
-        ws.set_column(res_col_idx, res_col_idx, None, fmt)
-
-    return df
-
-# ------------------------------ example usage --------------------------------
+# ----------------------------- example usage -----------------------------
 if __name__ == "__main__":
-    # Change these paths as needed:
-    input_file  = "template_2.xlsx"  # or your CSV/XLSX
-    output_file = "results_replicate_variance_shrunk_1dp.xlsx"
-    generate_final_synthetic(input_file, output_file)
-    print(f"Saved: {output_file}")
+    # === Paste YOUR features here (from your original study) ===
+    # Variance components (same units as your data)
+    MU     = 6.762916666666667    # grand mean
+    VAR_A  = 0.15610416666666668  # replicate/analytical variance (σ²_A)
+    VAR_WP = 0.6699826388888888   # within-subject variance (σ²_WP)
+    VAR_BP = 0.8247793291962177   # between-subject variance (σ²_BP)
+
+    # Grid describing your study layout (choose ONE of the two options):
+    # Option A) Balanced grid — set these to match your study's counts:
+    I, S, R = 30, 4, 2   # <<< REPLACE with your subject/sample/replicate counts
+
+    # Option B) Custom grid — provide a DataFrame with these exact columns:
+    # custom_grid = pd.DataFrame({
+    #     "Subject":  ["P01","P01","P01","P02","P02","P02","P02"],
+    #     "Sample":   [1,1,2,1,1,2,3],
+    #     "Replicate":[1,2,1,1,2,1,1],
+    # })
+
+    # Optional scale controls (enter YOUR known scale, or leave off):
+    #   - to match overall mean/sd:
+    SCALE_MODE   = "mean_sd"      # "none", "mean_sd", or "minmax"
+    REF_MEAN     = 6.762916666666667  # set to your dataset's mean if you want exact scale
+    REF_SD       = 1.0             # set to your dataset's SD if known (example value)
+    #   - OR to match min/max range:
+    # SCALE_MODE = "minmax"; REF_MIN = 3.5; REF_MAX = 10.1
+
+    # Generate synthetic data (no file reads)
+    df_syn = simulate_bv_from_features(
+        mu=MU, var_A=VAR_A, var_WP=VAR_WP, var_BP=VAR_BP,
+        I=I, S=S, R=R,            # or grid=custom_grid
+        seed=2025,
+        enforce_exact_component_vars=True,
+        scale_mode=SCALE_MODE,
+        ref_mean=REF_MEAN, ref_sd=REF_SD,
+        # ref_min=REF_MIN, ref_max=REF_MAX,
+        clip_nonnegative=True,
+        rounding_decimals=1,      # set to your typical decimals (e.g., 1)
+    )
+
+    print(df_syn.head())
+
+    # (Optional) verify realized components on the synthetic data:
+    gm, va, vwp, vbp = estimate_components_unbalanced(df_syn.rename(columns=str.title))
+    print("\nRealized components on synthetic data:")
+    print(f"  grand mean ≈ {gm:.6f}")
+    print(f"  var_A      ≈ {va:.6f}")
+    print(f"  var_WP     ≈ {vwp:.6f}")
+    print(f"  var_BP     ≈ {vbp:.6f}")
+    
+df_syn
