@@ -31,10 +31,10 @@ for i in range(1, N_SUBJECTS + 1):
 
 df = pd.DataFrame(rows, columns=["Subject", "Sample", "Replicate", "Result"])
 
-# Center so the sample mean is exactly MU (nice-to-have)
+# Center 
 df["Result"] = df["Result"] - (df["Result"].mean() - MU)
 
-# Round like your workbook
+# Rounding
 df["Result"] = df["Result"].round(2)
 
 # Save
