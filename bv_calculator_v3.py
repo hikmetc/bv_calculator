@@ -243,7 +243,8 @@ class BVResult:
     # confidence intervals & RCV
     ci_cv_I: tuple[float, float]  # (lower, upper) on CV_I
     ci_cv_G: tuple[float, float]  # (lower, upper) on CV_G   ← new
-    rcv_95: float                 # % change considered significant (95 %)
+    rcv_95_down: float   # % decrease (reported as a positive number)
+    rcv_95_up: float     # % increase
 
     # NEW – verbose audit trail of what happened during cleaning
     preprocess_log: list[str] = field(default_factory=list)
@@ -399,6 +400,75 @@ def _style_details_series(s: pd.Series) -> list[str]:
             styles.append("")                           # default text color
     return styles
 
+# population trend plot
+def plot_population_trend(clean_df: pd.DataFrame) -> go.Figure:
+    # collapse to Subject×Sample means, then average across subjects at each time
+    ds = (clean_df.groupby(["Subject","Sample"], as_index=False)["Result"].mean())
+    ts = (ds.groupby("Sample")["Result"].agg(["mean","count","std"]).reset_index())
+    # OLS line on (Sample, mean)
+    x = ts["Sample"].values.astype(float)
+    y = ts["mean"].values.astype(float)
+    b1, b0 = np.polyfit(x, y, 1)   # slope, intercept
+    yhat = b1 * x + b0
+
+    unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
+    ylab = "Result" + (f" ({unit})" if unit else "")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="Mean per time"))
+    fig.add_trace(go.Scatter(x=x, y=yhat, mode="lines", name="OLS fit"))
+    fig.update_layout(template="simple_white", height=280,
+                      xaxis_title="Sample (time)", yaxis_title=ylab,
+                      margin=dict(l=40, r=10, t=30, b=40), showlegend=False)
+    return fig
+
+
+def plot_population_trend(clean_df: pd.DataFrame) -> go.Figure:
+    """
+    Show cohort mean at each Sample (time) with an OLS fit line.
+    X-axis ticks are forced to show *every* Sample value.
+    """
+    # collapse to Subject×Sample means, then mean across subjects per Sample
+    ds = (clean_df.groupby(["Subject", "Sample"], as_index=False)["Result"].mean())
+    ts = (ds.groupby("Sample")["Result"].agg(mean="mean", count="count", std="std").reset_index())
+
+    # make sure sample axis is numeric and sorted
+    samples = ts["Sample"].astype(int).sort_values().to_numpy()
+    means   = ts.set_index("Sample").loc[samples, "mean"].to_numpy()
+
+    # simple OLS fit on (Sample, mean)
+    if len(samples) >= 2:
+        b1, b0 = np.polyfit(samples.astype(float), means.astype(float), 1)  # slope, intercept
+        yhat = b1 * samples + b0
+    else:
+        yhat = means  # not enough points to fit
+
+    unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
+    ylab = "Result" + (f" ({unit})" if unit else "")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=samples, y=means, mode="markers", name="Mean per time"))
+    fig.add_trace(go.Scatter(x=samples, y=yhat,   mode="lines",   name="OLS fit"))
+
+    # Force a tick at *every* sample value
+    tickvals = samples.tolist()
+    fig.update_layout(
+        template="simple_white",
+        height=280,
+        margin=dict(l=40, r=10, t=30, b=40),
+        xaxis=dict(
+            title="Sample (time)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=[str(v) for v in tickvals],
+            range=[samples.min() - 0.5, samples.max() + 0.5],  # small padding left/right
+            showgrid=False
+        ),
+        yaxis=dict(title=ylab, zeroline=False, showgrid=False),
+        showlegend=False
+    )
+    return fig
+
 
 
 # ——————————————————————————————————————————————————————————————
@@ -469,6 +539,73 @@ def _reed_outlier(values: np.ndarray) -> int | None:
     if (s_val[1] - s_val[0]) > rng / 3:
         return int(s_idx[0])
     return None
+
+
+
+# === Population-wide drift (fixed-effects within estimator) ===
+def estimate_population_drift(df: pd.DataFrame,
+                              alpha: float = 0.05,
+                              collapse_replicates: bool = True) -> dict:
+    """
+    Estimate a *common within-subject* slope of Result vs Sample across the cohort.
+    Approach: subject fixed-effects (within estimator).
+      1) Optionally collapse replicates to Subject×Sample means (reduces CVA noise).
+      2) Demean both y (Result) and x (Sample) within each subject.
+      3) OLS on the demeaned variables → single pooled slope.
+      4) Exact t-based CI using df_resid = N - G - 1 (G = #subjects used).
+
+    Returns dict with keys:
+      slope, se, t, df, p, ci_low, ci_high, n_subjects, n_points
+    """
+    if collapse_replicates:
+        d = (df.groupby(["Subject", "Sample"], as_index=False)["Result"]
+                .mean())
+    else:
+        # keep replicates; they just add analytical noise
+        d = df[["Subject", "Sample", "Result"]].copy()
+
+    # need at least two time points per subject for a slope contribution
+    counts = d.groupby("Subject")["Sample"].nunique()
+    keep_ids = counts[counts >= 2].index
+    d = d[d["Subject"].isin(keep_ids)].copy()
+
+    if d.empty or d["Subject"].nunique() < 2:
+        raise ValueError("Insufficient data for population drift (need ≥2 subjects with ≥2 samples).")
+
+    # demean within each subject (within estimator / fixed effects)
+    d["y"] = d["Result"] - d.groupby("Subject")["Result"].transform("mean")
+    d["x"] = d["Sample"] - d.groupby("Subject")["Sample"].transform("mean")
+
+    # drop rows with zero within-subject x (can happen if all Sample equal)
+    d = d[d["x"].abs() > 0].copy()
+    if d.empty:
+        raise ValueError("No within-subject time variation after demeaning.")
+
+    Sxy = float((d["x"] * d["y"]).sum())
+    Sxx = float((d["x"] ** 2).sum())
+    slope = Sxy / Sxx
+
+    # residuals & standard error
+    resid = d["y"] - slope * d["x"]
+    n = len(d)
+    g = d["Subject"].nunique()
+    df_resid = int(n - g - 1)          # FE: subtract g subject effects + slope
+    if df_resid <= 0:
+        raise ValueError("Not enough degrees of freedom for pooled slope.")
+    sigma2 = float((resid ** 2).sum() / df_resid)
+    se = float(np.sqrt(sigma2 / Sxx))
+
+    # t, p, CI
+    t_stat = float(slope / se)
+    p = float(2 * (1 - t.cdf(abs(t_stat), df_resid)))
+    tcrit = float(t.ppf(1 - alpha/2, df_resid))
+    ci_low  = float(slope - tcrit * se)
+    ci_high = float(slope + tcrit * se)
+
+    return dict(slope=slope, se=se, t=t_stat, df=df_resid, p=p,
+                ci_low=ci_low, ci_high=ci_high,
+                n_subjects=int(g), n_points=int(n))
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -716,6 +853,30 @@ def _preprocess_bv_dataframe(
         log.append("Steady‑state drift (QI 7) skipped (switch off).")
 
 
+    # ─────────────────────────────────────────────────────────────
+    # QI 7 (population) – pooled within-subject drift across cohort
+    # ─────────────────────────────────────────────────────────────
+    if ON("pop_drift"):
+        try:
+            pop = estimate_population_drift(df, alpha=alpha, collapse_replicates=True)
+            # report slope in “Result unit per one Sample step”
+            unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
+            unit_txt = f" {unit}" if unit else ""
+            log.append(
+                "QI 7 – population drift: "
+                f"slope = {pop['slope']:+.3g}{unit_txt}/sample "
+                f"(95% CI {pop['ci_low']:.3g} to {pop['ci_high']:.3g}, "
+                f"t = {pop['t']:.2f}, df = {pop['df']}, p = {pop['p']:.3g}; "
+                f"{pop['n_subjects']} subjects; {pop['n_points']} points). "
+                "No exclusions are performed at this step."
+            )
+
+        except Exception as e:
+            log.append(f"QI 7 – population drift estimation skipped: {e}")
+    else:
+        log.append("Population drift (QI 7, pooled) skipped (switch off).")
+
+
     # ════════════════════════════════════════════════════════════════════════
     # 2.  Normality assessment  (subject-level  +  subject-means)   ⟨QI 9⟩
     # ════════════════════════════════════════════════════════════════════════
@@ -769,15 +930,6 @@ def _preprocess_bv_dataframe(
     else:
         log.append("Normality checks / log‑transform (QI 9) skipped (switch off).")  
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 3.  Variance-homogeneity across subjects (Bartlett, QI 10)
-    # ════════════════════════════════════════════════════════════════════════
-#    if df["Subject"].nunique() >= 2:
-#        bart_p = bartlett(*[g["Result"].values for _, g in df.groupby("Subject")])[1]
-#        msg    = ("heterogeneous" if bart_p < 0.05 else "homogeneous")
-#        log.append(f"Bartlett test (QI 10): p = {bart_p:.3g} → variances {msg}.")
-#    else:
-#        log.append("Bartlett test skipped – fewer than two subjects remain.")
 
     # ════════════════════════════════════════════════════════════════════════
     # 3.  Variance‑homogeneity *across subjects*  (Bartlett, QI 10 – Excel uyumlu)
@@ -1102,6 +1254,62 @@ def _cvg_ln_unbalanced(clean_df: pd.DataFrame, alpha: float
           float(np.sqrt(np.exp(var_hi) - 1.0) * 100))
     return cvg, ci
 
+
+# === Lognormal RCV helper (Fokkema et al.) ===
+Z_BIDIR_95 = 1.64  # one-sided 95% by default
+
+def rcv_lognormal(cv_a_pct: float, cv_i_pct: float, z: float = Z_BIDIR_95) -> tuple[float, float]:
+    """
+    Return (RCV_down %, RCV_up %) using the lognormal/asymmetric method.
+
+    σ_A² = ln(1 + (CVa/100)²),  σ_I² = ln(1 + (CVi/100)²)
+    SD   = sqrt( 2 * (σ_A² + σ_I²) )
+    RCV↑ = (exp(+z * SD) - 1) * 100
+    RCV↓ = (1 - exp(-z * SD)) * 100
+    """
+    cv_a = cv_a_pct / 100.0
+    cv_i = cv_i_pct / 100.0
+    sigma2 = np.log1p(cv_a**2) + np.log1p(cv_i**2)  # ln(1 + cv^2)
+    SD = np.sqrt(2.0 * sigma2)
+    rcv_up = (np.exp(z * SD) - 1.0) * 100.0
+    rcv_down = (1.0 - np.exp(-z * SD)) * 100.0
+    return rcv_down, rcv_up
+
+# === APS from BV (imprecision, bias, MAU) ===
+def build_aps_table(cvi_pct: float, cvg_pct: float, k: float = 2.0) -> pd.DataFrame:
+    """
+    Return APS (Minimum / Desirable / Optimal) as a DataFrame.
+
+    Formulas (all in %):
+      CVa_spec  = f × CVI
+      Bias_spec = g × sqrt(CVI² + CVG²)
+      MAU_spec  = k × f × CVI        # expanded allowable measurement uncertainty
+
+    Factors by level:
+      Optimal:   f=0.25, g=0.125
+      Desirable: f=0.50, g=0.25
+      Minimum:   f=0.75, g=0.375
+
+    Abbreviations: CVa (analytical imprecision), CVI (within-subject BV),
+                   CVG (between-subject BV), MAU (expanded allowable measurement uncertainty).
+    """
+    term = float(np.sqrt(cvi_pct**2 + cvg_pct**2))
+    levels = [
+        ("Minimum",   0.75,  0.375),
+        ("Desirable", 0.50,  0.25),
+        ("Optimal",   0.25,  0.125),
+    ]
+    rows = []
+    for name, f_imp, g_bias in levels:
+        rows.append({
+            "Specification": name,
+            "CVa":  f_imp * cvi_pct,
+            "Bias": g_bias * term,
+            "MAU (k=2)": k * f_imp * cvi_pct,  # k fixed to 2
+        })
+    return pd.DataFrame(rows)
+
+
 # ——— helper for the unbalanced branch ——————————————————————————————
 def _calculate_bv_unbalanced(df: pd.DataFrame,
                              alpha: float = 0.05) -> dict[str, float]:
@@ -1162,13 +1370,15 @@ def _calculate_bv_unbalanced(df: pd.DataFrame,
     cv_G     = cvg_ln
     ci_cv_G  = ci_cvg_ln
                                
-    rcv = 1.96*np.sqrt(2)*np.sqrt(cv_A**2 + cv_I**2)
+    rcv_down, rcv_up = rcv_lognormal(cv_A, cv_I, z=Z_BIDIR_95)
+
 
     return dict(var_A=var_A, var_WP=var_WP, var_BP=var_BP,
                 cv_A=cv_A, cv_I=cv_I, cv_G=cv_G,
                 ci_cv_A=ci_cv_A, ci_cv_I=ci_cv_I, ci_cv_G=ci_cv_G,
-                rcv=rcv, grand=grand,
+                rcv_down=rcv_down, rcv_up=rcv_up, grand=grand,
                 df_bp=df_bp, df_wp=df_wp, df_a=df_a)
+
 
 # ——————————————————————————————————————————————————————————————
 # 4.  Core calculation routine (closed‑form Røraas algebra)
@@ -1264,10 +1474,11 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             ci_cv_A = ub["ci_cv_A"],
             ci_cv_I = ub["ci_cv_I"],
             ci_cv_G = ub["ci_cv_G"],
-            rcv_95 = ub["rcv"],
+            rcv_95_down = ub["rcv_down"],
+            rcv_95_up   = ub["rcv_up"],
             preprocess_log = pp_log,
-            cv_I_cv_anova = cv_anova,               # ← NEW
-            ci_cv_I_cv_anova = ci_cv_anova          # ← NEW
+            cv_I_cv_anova = cv_anova,               
+            ci_cv_I_cv_anova = ci_cv_anova          
         )
 
 
@@ -1362,7 +1573,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
         pp_log.append("CVG estimated on ln scale and back-transformed.")
 
         # 3.11 reference‑change value (two‑sided, 95 %)
-        rcv = 1.96 * np.sqrt(2) * np.sqrt(cv_A**2 + cv_I**2)
+        rcv_down, rcv_up = rcv_lognormal(cv_A, cv_I, z=Z_BIDIR_95)
         
         # ⟨QI-6⟩ analytical imprecision – put a note into the audit trail
         pp_log.append(
@@ -1385,7 +1596,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             cv_A, cv_I, cv_G,
             ci_mean,          # add here
             ci_cv_A,          # add here
-            ci_cv_I, ci_cv_G, rcv,
+            ci_cv_I, ci_cv_G, rcv_down, rcv_up,
             preprocess_log = pp_log,
             cv_I_cv_anova = cv_anova,
             ci_cv_I_cv_anova = ci_cv_anova,
@@ -1406,6 +1617,10 @@ def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
     -------
     plotly.graph_objects.Figure
     """
+    # read unit from session_state if present
+    unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
+    y_title = "Result" + (f" ({unit})" if unit else "")
+
     # ── summarise data ──────────────────────────────────────────────────────
     agg = (clean_df.groupby("Subject")["Result"]
                   .agg(mean="mean", min="min", max="max")
@@ -1456,7 +1671,7 @@ def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
             showgrid=False
         ),
         yaxis=dict(
-            title="Result",
+            title=y_title,
             zeroline=False,
             showgrid=False,
             ticks="outside",
@@ -1544,6 +1759,7 @@ with st.sidebar:
         "Sample Cochran (QI 8b)"     : ("samp_cochran",         True),
         "Reed between‑subject (QI 8c)":("reed",                 True),
         "Steady‑state drift (QI 7)"  : ("drift",                True),
+        "Population drift (QI 7)": ("pop_drift",                False),
         "Normality checks / log‑transform (QI 9)"
                                     : ("normality",           True),
         "Within‑subject Bartlett (QI 10)"
@@ -1640,7 +1856,8 @@ with instr_tab:
 
         st.markdown("### Recommended study design")
         st.info("**≥20 subjects**, **≥3 samples/subject**, **≥2 replicates/sample** is a good starting point.", icon="✅")
-
+    st.info("**When using BIVAC, please cite the following reference:** *Aarsand AK, Røraas T, Fernandez-Calle P, Ricos C, Díaz-Garzón J, Jonker N, Perich C, González-Lao E, Carobene A, Minchinela J, Coşkun A, Simón M, Álvarez V, Bartlett WA, Fernández-Fernández P, Boned B, Braga F, Corte Z, Aslan B, Sandberg S; European Federation of Clinical Chemistry and Laboratory Medicine Working Group on Biological Variation and Task and Finish Group for the Biological Variation Database. The Biological Variation Data Critical Appraisal Checklist: A Standard for Evaluating Studies on Biological Variation. Clin Chem. 2018 Mar;64(3):501-514. doi: 10.1373/clinchem.2017.281808. Epub 2017 Dec 8. PMID: 29222339.*")
+    st.info("**To report biological variation data appropriately, please refer:** *Bartlett WA, Sandberg S, Carobene A, Fernandez-Calle P, Diaz-Garzon J, Coskun A, Jonker N, Galior K, Gonzales-Lao E, Moreno-Parro I, Sufrate-Vergara B, Webster C, Itkonen O, Marques-García F, Aarsand AK. A standard to report biological variation data studies - based on an expert opinion. Clin Chem Lab Med. 2024 Jul 8;63(1):52-59. doi: 10.1515/cclm-2024-0489. PMID: 38965828.*")
 
 
     st.divider()
@@ -1728,6 +1945,7 @@ if (curr_origin != prev_origin) or (curr_cols != prev_cols) or (curr_rows != pre
     st.session_state["mapping_ok"] = False
     st.session_state["mapped_df"] = None
     st.session_state["mapped_source_cols"] = list(user_df.columns) if user_df is not None else None
+    st.session_state["result_unit"] = ""   # NEW: clear unit when data fingerprint changes
 
 # Persist current fingerprint for next run
 st.session_state["data_origin"] = curr_origin
@@ -1777,6 +1995,12 @@ if user_df is not None:
                 samp_sel = st.selectbox("Sample / time-point", cols,
                                         index=_default_idx("Sample", cols),
                                         help="Visit/order per subject (1, 2, 3…).")
+                result_unit = st.text_input(
+                                            "Unit for Result values (e.g., mg/dL, mmol/L)",
+                                            value=st.session_state.get("result_unit", ""),
+                                            placeholder="e.g., mg/dL",
+                                            help="This unit will be shown next to the mean concentration."
+                                        )
             with c2:
                 repl_sel = st.selectbox("Replicate",          cols,
                                         index=_default_idx("Replicate", cols),
@@ -1804,6 +2028,7 @@ if user_df is not None:
                         st.warning(w)
                 st.session_state["mapping_ok"] = True
                 st.session_state["mapped_df"] = mapped_df
+                st.session_state["result_unit"] = (result_unit or "").strip()   # NEW
                 st.session_state["mapped_source_cols"] = list(user_df.columns)  # NEW
                 st.success("Mapping saved ✓ — columns validated and ready to calculate.")
                 st.caption(f"Preview of mapped columns (first 8 rows):")
@@ -1873,12 +2098,14 @@ if user_df is not None:
                 #  Key metrics – two-row layout
                 # ────────────────────────────────────────────────────────────
                 st.subheader("Key metrics")
+                # NEW: pull the saved unit once (empty string if not set)
+                unit = st.session_state.get("result_unit", "").strip()
 
                 # --- build the metrics list ---
                 metrics = [
                     ("Mean (CI)",
-                    f"{res.grand_mean:.2f}",
-                    f"({res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f})"),
+                    f"{res.grand_mean:.2f}" + (f" {unit}" if unit else ""),
+                    f"({res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f})" + (f" {unit}" if unit else "")),
                     ("CV<sub>A</sub> (CI%)",
                     f"{res.cv_A:.2f}",
                     f"({res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f})"),
@@ -1887,7 +2114,7 @@ if user_df is not None:
                         f"({res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f})"),
                     ("CV<sub>G</sub> (CI%)",  f"{res.cv_G:.2f}",
                         f"({res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f})"),
-                    ("RCV (95%)",        f"±{res.rcv_95:.2f}",                                    None),
+                    ("RCV (95%) (lognormal)", f"−{res.rcv_95_down:.2f}% / +{res.rcv_95_up:.2f}%", None),
                 ]
 
                 # append the optional CV-ANOVA metric as *last* element
@@ -1959,15 +2186,87 @@ if user_df is not None:
                 )
 
 
+                # -------------------- APS TABLE --------------------
+                st.write(" ")
+                st.subheader("Analytical Performance Specifications (APS)")
+
+                # Pick CVI to feed into APS: CV-ANOVA if selected & available, else standard ANOVA
+                use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
+                if use_cv_anova_flag and (res.cv_I_cv_anova is not None):
+                    cvi_for_aps = float(res.cv_I_cv_anova)
+                    cvi_source  = "CV-ANOVA"
+                    cvi_ci      = res.ci_cv_I_cv_anova
+                else:
+                    cvi_for_aps = float(res.cv_I)
+                    cvi_source  = "standard ANOVA"
+                    cvi_ci      = res.ci_cv_I
+
+                aps_df = build_aps_table(
+                    cvi_pct=cvi_for_aps,   # ← now driven by selection above
+                    cvg_pct=res.cv_G,      # k fixed to 2.0 inside the helper
+                )
+
+                st.dataframe(
+                    aps_df.style
+                        .format({"CVa": "{:.1f}", "Bias": "{:.1f}", "MAU (k=2)": "{:.1f}"})
+                        .set_table_styles([{
+                            "selector": "th",
+                            "props": [("background-color", "#d0e7f5"), ("color", "#1e3a5f")]
+                        }]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.caption(
+                    "Formulas: CVa = f×CVI; Bias = g×√(CVI²+CVG²); MAU = k×f×CVI with fixed k=2 (reflects 95% confidence interval (CI)). "
+                    "Levels → Optimal: f=0.25, g=0.125; Desirable: f=0.50, g=0.25; Minimum: f=0.75, g=0.375. "
+                    "Abbreviations: CVa analytical CV; CVI within-subject BV; CVG between-subject BV; "
+                    "MAU expanded allowable measurement uncertainty."
+                )
+
+                # Make it crystal-clear which CVI fed the APS numbers
+                st.caption(
+                    f"CVI used for APS: **{cvi_source}** → {cvi_for_aps:.2f}% "
+                    f"(95% CI {cvi_ci[0]:.2f}–{cvi_ci[1]:.2f}%)."
+                )
+                # ---------------------------------------------------
+
+
 
                 # — Per-subject mean ± range plot ————————————————————————————————
-                clean_df, _ = _preprocess_bv_dataframe(
+                # Build two datasets:
+                #  1) pre-balance → used for QI 7 population trend (FE) and its plot
+                #  2) final (may be balanced) → used for the rest of the outputs/plots
+                prebal_df, _ = _preprocess_bv_dataframe(
                     df_for_calc,
-                    flags=st.session_state["preproc_flags"],      # ← add
+                    flags=st.session_state["preproc_flags"],
+                    enforce_balance=False
+                )
+                final_df, _ = _preprocess_bv_dataframe(
+                    df_for_calc,
+                    flags=st.session_state["preproc_flags"],
                     enforce_balance=st.session_state["enforce_balance"]
                 )
+
+                # — Per-subject mean ± range plot — (final dataset)
                 st.subheader("Per-subject distribution")
-                st.plotly_chart(plot_subject_ranges(clean_df), use_container_width=True)
+                st.plotly_chart(plot_subject_ranges(final_df), use_container_width=True)
+
+                # === Population trend readout (pre-balance) ===
+                st.subheader("Population time trend (pre-balance)")
+                try:
+                    pop = estimate_population_drift(prebal_df, alpha=0.05, collapse_replicates=True)
+                    unit = st.session_state.get("result_unit", "").strip()
+                    unit_txt = f" {unit}" if unit else ""
+                    st.markdown(
+                        f"**Slope per sample:** {pop['slope']:+.4g}{unit_txt}/sample "
+                        f"(95% CI {pop['ci_low']:.4g} to {pop['ci_high']:.4g}, "
+                        f"p = {pop['p']:.3g}, df = {pop['df']})."
+                    )
+                    st.plotly_chart(plot_population_trend(prebal_df), use_container_width=True)
+                except Exception as e:
+                    st.info(f"Population drift not computed: {e}")
+
 
 
                 # ---------------------------------------------------------------------------
@@ -2111,7 +2410,7 @@ if user_df is not None:
 
                     # ---------------- QI 12 (confidence limits) ----------------
                     grade["12"] = "A"
-                    comment["12"] = "95% CIs for CVA/CVI/CVG provided (or computable)."
+                    comment["12"] = "95% CIs for CVA/CVI/CVG provided."
                     details["12"].append(
                         f"CIs present: CVA {res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}%, "
                         f"CVI {res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}%, "
@@ -2133,10 +2432,21 @@ if user_df is not None:
                         comment["13"] = "Counts not documented."
 
                     # ---------------- QI 14 (mean concentration) ----------------
+
+                    unit = st.session_state.get("result_unit", "").strip()  # NEW
                     grade["14"] = "A"
-                    comment["14"] = f"Mean concentration reported ({res.grand_mean:.2f})."
-                    details["14"].append(f"Mean {res.grand_mean:.2f} "
-                                        f"(95% CI {res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f}).")
+                    comment["14"] = (
+                        f"Mean concentration reported ({res.grand_mean:.2f}"
+                        + (f" {unit}" if unit else "")
+                        + ")."
+                    )
+                    details["14"].append(
+                        f"Mean {res.grand_mean:.2f}"
+                        + (f" {unit}" if unit else "")
+                        + f" (95% CI {res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f}"
+                        + (f" {unit}" if unit else "")
+                        + ")."
+                    )
 
                     # assemble rows (add Details column)
                     rows, overall = [], "A"
@@ -2158,7 +2468,7 @@ if user_df is not None:
                 st.subheader("BIVAC Checklist (QI 1 → QI 14)")
                 # After clean_df is created (you already have this a few lines above)
                 n_raw  = len(df_for_calc)
-                n_kept = len(clean_df)
+                n_kept = len(final_df)
 
                 bivac_df = _build_qi_checklist(
                     res.preprocess_log,
