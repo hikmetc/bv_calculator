@@ -402,28 +402,6 @@ def _style_details_series(s: pd.Series) -> list[str]:
 
 # population trend plot
 def plot_population_trend(clean_df: pd.DataFrame) -> go.Figure:
-    # collapse to Subject×Sample means, then average across subjects at each time
-    ds = (clean_df.groupby(["Subject","Sample"], as_index=False)["Result"].mean())
-    ts = (ds.groupby("Sample")["Result"].agg(["mean","count","std"]).reset_index())
-    # OLS line on (Sample, mean)
-    x = ts["Sample"].values.astype(float)
-    y = ts["mean"].values.astype(float)
-    b1, b0 = np.polyfit(x, y, 1)   # slope, intercept
-    yhat = b1 * x + b0
-
-    unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
-    ylab = "Result" + (f" ({unit})" if unit else "")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name="Mean per time"))
-    fig.add_trace(go.Scatter(x=x, y=yhat, mode="lines", name="OLS fit"))
-    fig.update_layout(template="simple_white", height=280,
-                      xaxis_title="Sample (time)", yaxis_title=ylab,
-                      margin=dict(l=40, r=10, t=30, b=40), showlegend=False)
-    return fig
-
-
-def plot_population_trend(clean_df: pd.DataFrame) -> go.Figure:
     """
     Show cohort mean at each Sample (time) with an OLS fit line.
     X-axis ticks are forced to show *every* Sample value.
@@ -2234,38 +2212,42 @@ if user_df is not None:
 
 
                 # — Per-subject mean ± range plot ————————————————————————————————
-                # Build two datasets:
-                #  1) pre-balance → used for QI 7 population trend (FE) and its plot
-                #  2) final (may be balanced) → used for the rest of the outputs/plots
-                prebal_df, _ = _preprocess_bv_dataframe(
-                    df_for_calc,
-                    flags=st.session_state["preproc_flags"],
-                    enforce_balance=False
-                )
+                # Build only the final dataset unconditionally (balanced/unbalanced per sidebar)
                 final_df, _ = _preprocess_bv_dataframe(
                     df_for_calc,
                     flags=st.session_state["preproc_flags"],
                     enforce_balance=st.session_state["enforce_balance"]
                 )
 
-                # — Per-subject mean ± range plot — (final dataset)
                 st.subheader("Per-subject distribution")
                 st.plotly_chart(plot_subject_ranges(final_df), use_container_width=True)
 
-                # === Population trend readout (pre-balance) ===
-                st.subheader("Population time trend (pre-balance)")
-                try:
-                    pop = estimate_population_drift(prebal_df, alpha=0.05, collapse_replicates=True)
-                    unit = st.session_state.get("result_unit", "").strip()
-                    unit_txt = f" {unit}" if unit else ""
-                    st.markdown(
-                        f"**Slope per sample:** {pop['slope']:+.4g}{unit_txt}/sample "
-                        f"(95% CI {pop['ci_low']:.4g} to {pop['ci_high']:.4g}, "
-                        f"p = {pop['p']:.3g}, df = {pop['df']})."
+                # ⬇️ NEW: run/show population trend ONLY if the sidebar switch is ON
+                if st.session_state["preproc_flags"].get("pop_drift", False):
+                    # Build the pre-balance dataset only now (so we don't pay the cost unless needed)
+                    prebal_df, _ = _preprocess_bv_dataframe(
+                        df_for_calc,
+                        flags=st.session_state["preproc_flags"],
+                        enforce_balance=False
                     )
-                    st.plotly_chart(plot_population_trend(prebal_df), use_container_width=True)
-                except Exception as e:
-                    st.info(f"Population drift not computed: {e}")
+
+                    st.subheader("Population time trend (pre-balance)")
+                    try:
+                        # (Optional micro-optimization: cache this call or reuse a value stored in session_state)
+                        pop = estimate_population_drift(prebal_df, alpha=0.05, collapse_replicates=True)
+                        unit = st.session_state.get("result_unit", "").strip()
+                        unit_txt = f" {unit}" if unit else ""
+                        st.markdown(
+                            f"**Slope per sample:** {pop['slope']:+.4g}{unit_txt}/sample "
+                            f"(95% CI {pop['ci_low']:.4g} to {pop['ci_high']:.4g}, "
+                            f"p = {pop['p']:.3g}, df = {pop['df']})."
+                        )
+                        st.plotly_chart(plot_population_trend(prebal_df), use_container_width=True)
+                    except Exception as e:
+                        st.info(f"Population drift not computed: {e}")
+                else:
+                    st.caption("Enable **Population drift (QI 7)** in the sidebar to compute and display the pooled time trend.")
+
 
 
 
