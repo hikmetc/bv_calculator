@@ -38,10 +38,11 @@ import numpy as np                       # scientific number‑crunching
 import pandas as pd                      # tabular data handling
 import streamlit as st                   # web UI framework
 from scipy.stats import chi2 , t            # chi‑square for exact CI of variance
-from scipy.stats import shapiro, kstest, f              # normality + Cochran
+from scipy.stats import shapiro, f              # normality + Cochran
 from scipy.stats import bartlett, linregress  
-import plotly.graph_objects as go   # ← NEW
+import plotly.graph_objects as go  
 import re, html
+
 
 # ——————————————————————————————————————————————————————————————
 # 1.  Streamlit page config (title, layout)
@@ -135,6 +136,75 @@ st.markdown(
         background: #d0e7f5;
         color: #1e3a5f;
         text-shadow: 0 1px 1px rgba(255,255,255,0.9);
+      }
+      /* ===== Key metrics (table) – fancy HTML table ===== */
+      .km-wrap { margin-top: .5rem; }
+      table.km-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0 .45rem;   /* “card rows” */
+        font-family: 'Georgia', serif;
+      }
+      table.km-table thead th{
+        text-align: left;
+        font-size: .85rem;
+        letter-spacing: .03em;
+        color: #1e3a5f;
+        background: #d0e7f5;
+        padding: .65rem .8rem;
+        border: 1px solid #b0c4de;
+      }
+      table.km-table thead th:first-child{ border-top-left-radius: .8rem; border-bottom-left-radius: .8rem; }
+      table.km-table thead th:last-child { border-top-right-radius:.8rem; border-bottom-right-radius:.8rem; }
+
+      table.km-table tbody tr{
+        background: linear-gradient(145deg, #ffffff, #f6fbff);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      }
+      table.km-table tbody td{
+        padding: .75rem .8rem;
+        border-top: 1px solid #e3eef8;
+        border-bottom: 1px solid #e3eef8;
+      }
+      table.km-table tbody td:first-child{
+        border-left: 1px solid #e3eef8;
+        border-top-left-radius: .85rem;
+        border-bottom-left-radius: .85rem;
+        font-weight: 700;
+        color: #1e3a5f;
+      }
+      table.km-table tbody td:last-child{
+        border-right: 1px solid #e3eef8;
+        border-top-right-radius: .85rem;
+        border-bottom-right-radius: .85rem;
+        text-align: right;
+        white-space: nowrap;
+      }
+      table.km-table tbody tr:hover{
+        transform: translateY(-1px);
+        box-shadow: 0 6px 14px rgba(0,0,0,0.08);
+      }
+
+      .km-pill{
+        display:inline-block;
+        padding: .12rem .5rem;
+        border-radius: 999px;
+        background: #e8f4fd;
+        border: 1px solid #a3cce3;
+        color: #28527a;
+        font-size: .72rem;
+        margin-right: .45rem;
+        vertical-align: middle;
+      }
+      .km-ci{
+        color:#5d6d7e;
+        font-size:.78rem;
+        margin-left:.4rem;
+        white-space: nowrap;
+      }
+      .km-value{
+        font-weight: 800;
+        color:#1b263b;
       }
       /* ==== Preprocessing log highlighting ==== */
     .log-list{ list-style: none; padding-left: 0; margin: 0; }
@@ -253,7 +323,8 @@ class BVResult:
     cv_I_cv_anova: float | None = None
     ci_cv_I_cv_anova: tuple[float, float] | None = None
 
-
+    # NEW: store the exact cleaned dataframe used for the final ANOVA
+    clean_df: pd.DataFrame | None = None
 # ——————————————————————————————————————————————————————————————
 # 2-bis.  Column-mapping helpers
 # ——————————————————————————————————————————————————————————————
@@ -448,6 +519,208 @@ def plot_population_trend(clean_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _build_qi_checklist(
+        log_lines: list[str],
+        res_: BVResult,
+        flags: dict[str, bool],
+        *,
+        qi_manual: dict[str, str] | None = None,
+        n_raw: int | None = None,
+        n_kept: int | None = None,
+        unit: str = "",
+) -> pd.DataFrame:
+    """BIVAC v1.1 checklist (QI 1–14) with Grade, Comment, and Details."""
+
+    def worst(g1, g2):
+        order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+        return g1 if order[g1] >= order[g2] else g2
+
+    def pick(*keywords):
+        hits = [l for l in log_lines if all(k.lower() in l.lower() for k in keywords)]
+        return hits
+
+    def any_kw(*keywords):
+        return any(k.lower() in l.lower() for l in log_lines for k in keywords)
+
+    details = {str(i): [] for i in range(1, 15)}
+    grade, comment = {}, {}
+
+    # ---------------- QI 1–5 (manual) ----------------
+    if qi_manual:
+        g1 = qi_manual.get("QI 1 – Scale", "A")
+        g2 = qi_manual.get("QI 2 – Subjects", "A")
+        g3 = qi_manual.get("QI 3 – Samples", "A")
+        g4 = qi_manual.get("QI 4 – Measurand/Method", "A")
+        g5 = qi_manual.get("QI 5 – Preanalytical", "A")
+        grade.update({"1": g1, "2": g2, "3": g3, "4": g4, "5": g5})
+        comment.update({
+            "1": f"User-selected {g1}.",
+            "2": f"User-selected {g2}.",
+            "3": f"User-selected {g3}.",
+            "4": f"User-selected {g4}.",
+            "5": f"User-selected {g5}."
+        })
+        details["1"].append(f"Manual: Scale → {g1}.")
+        details["2"].append(f"Manual: Subjects → {g2}.")
+        details["3"].append(f"Manual: Samples → {g3}.")
+        details["4"].append(f"Manual: Measurand/Method → {g4}.")
+        details["5"].append(f"Manual: Preanalytical → {g5}.")
+
+    # ---------------- QI 6 (analytical imprecision) ----------------
+    same_run = (qi_manual or {}).get("QI 6 – same run", True)
+    if res_.R >= 2 and same_run:
+        grade["6"] = "A"
+    elif res_.R >= 2:
+        grade["6"] = "B"
+    else:
+        grade["6"] = "C"
+    comment["6"] = f"{res_.R} replicate(s)/sample; {'same run' if same_run else 'different run/unknown'}."
+    details["6"].extend(pick("QI 6", "imprecision"))
+    details["6"].extend(pick("replicate", "Cochran"))
+    details["6"].append(f"CVₐ {res_.cv_A:.2f}% (95% CI {res_.ci_cv_A[0]:.2f}–{res_.ci_cv_A[1]:.2f}%).")
+
+    # ---------------- QI 7 (steady state / drift) ----------------
+    drift_checked = flags.get("drift", True)
+    drift_found = any_kw("temporal drift")
+    if drift_checked:
+        grade["7"] = "A"
+        comment["7"] = "Trend analysis performed; drifting subjects removed." if drift_found else "No drift detected."
+    else:
+        grade["7"] = "B"
+        comment["7"] = "Trend analysis not performed."
+    details["7"].extend(pick("QI 7", "temporal drift"))
+    details["7"].extend(pick("Total subjects excluded for drift"))
+    if not details["7"]:
+        details["7"].append("No drift messages in log.")
+
+    # ---------------- QI 8 (outliers) ----------------
+    rep_ok  = flags.get("rep_cochran", True)
+    samp_ok = flags.get("samp_cochran", True)
+    subj_ok = flags.get("reed", True)
+    if samp_ok and rep_ok and subj_ok:
+        grade["8"] = "A"; comment["8"] = "Replicate / sample / subject outlier tests performed."
+    elif samp_ok:
+        grade["8"] = "B"; comment["8"] = "Sample-level outlier test performed; replicate/subject not fully performed."
+    else:
+        grade["8"] = "C"; comment["8"] = "Sample-level outlier analysis not performed."
+    details["8"].extend(pick("Cochran (replicate"))
+    details["8"].extend(pick("replicate Cochran outlier removed"))
+    details["8"].extend(pick("Cochran (Subject"))
+    details["8"].extend(pick("sample Cochran outlier removed"))
+    details["8"].extend(pick("Reed mean outlier"))
+    if not details["8"]:
+        details["8"].append("No outlier removals recorded.")
+
+    # ---------------- QI 9 (normality) ----------------
+    norm_checked = flags.get("normality", True)
+    if norm_checked:
+        grade["9"] = "A"; comment["9"] = "Distribution assessed; transform if needed."
+    else:
+        grade["9"] = "B"; comment["9"] = "Distribution not assessed."
+    details["9"].extend(pick("Normality check"))
+    details["9"].extend(pick("Subject-means Shapiro-Wilk"))
+    details["9"].extend([l for l in log_lines if "log transform" in l.lower()])
+    if not details["9"]:
+        details["9"].append("No normality/transform messages in log.")
+
+    # ---------------- QI 10 (variance homogeneity) ----------------
+    wp_examined = flags.get("wp_bartlett", True)
+    het = any(("heterogeneous" in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
+    if wp_examined and not het:
+        grade["10"] = "A"; comment["10"] = "Variance homogeneity examined; acceptable."
+    else:
+        grade["10"] = "C"; comment["10"] = "Variance homogeneity not examined or heterogeneous."
+    details["10"].extend(pick("QI 10", "Bartlett"))
+    details["10"].extend(pick("Within-subject Bartlett"))
+    details["10"].extend(pick("High within-subject variance"))
+    details["10"].extend(pick("Replicate Bartlett"))
+    if not details["10"]:
+        details["10"].append("No variance-homogeneity messages in log.")
+
+    # ---------------- QI 11 (statistical method) ----------------
+    grade["11"] = "A"
+    if (res_.S == int(res_.S)) and (res_.R == int(res_.R)):
+        comment["11"] = "Nested ANOVA (balanced, closed-form)."
+        details["11"].append("Balanced crossed design; closed-form variance decomposition.")
+    else:
+        comment["11"] = "Variance decomposition on unbalanced data."
+        details["11"].append("Unbalanced design; method-of-moments variance decomposition.")
+
+    # ---------------- QI 12 (confidence limits) ----------------
+    grade["12"] = "A"
+    comment["12"] = "95% CIs for CVA/CVI/CVG provided."
+    details["12"].append(
+        f"CIs present: CVA {res_.ci_cv_A[0]:.2f}–{res_.ci_cv_A[1]:.2f}%, "
+        f"CVI {res_.ci_cv_I[0]:.2f}–{res_.ci_cv_I[1]:.2f}%, "
+        f"CVG {res_.ci_cv_G[0]:.2f}–{res_.ci_cv_G[1]:.2f}%."
+    )
+
+    # ---------------- QI 13 (counts) ----------------
+    if (n_raw is not None) and (n_kept is not None):
+        n_excl = max(n_raw - n_kept, 0)
+        grade["13"] = "A"
+        comment["13"] = f"{n_kept} used / {n_raw} raw (excluded {n_excl})."
+        details["13"].extend(pick("results retained", "Balanced data set"))
+        details["13"].append(f"Kept {n_kept} of {n_raw} measurements.")
+    elif (n_kept is not None):
+        grade["13"] = "B"
+        comment["13"] = f"{n_kept} results used (exclusions not documented)."
+    else:
+        grade["13"] = "C"
+        comment["13"] = "Counts not documented."
+
+    # ---------------- QI 14 (mean) ----------------
+    grade["14"] = "A"
+    comment["14"] = (
+        f"Mean concentration reported ({res_.grand_mean:.2f}"
+        + (f" {unit}" if unit else "")
+        + ")."
+    )
+    details["14"].append(
+        f"Mean {res_.grand_mean:.2f}"
+        + (f" {unit}" if unit else "")
+        + f" (95% CI {res_.ci_mean[0]:.2f}–{res_.ci_mean[1]:.2f}"
+        + (f" {unit}" if unit else "")
+        + ")."
+    )
+
+    rows, overall = [], "A"
+    for q in map(str, range(1, 15)):
+        overall = worst(overall, grade[q])
+        rows.append(dict(
+            QI=f"QI {q}",
+            Grade=grade[q],
+            Comment=comment[q],
+            Details=" ⏵ ".join(details[q]) if details[q] else ""
+        ))
+    out = pd.DataFrame(rows)
+    out.attrs["overall_grade"] = overall
+    return out
+
+
+
+
+
+def build_bivac_df_for_group(label: str, r: BVResult, raw_df: pd.DataFrame) -> pd.DataFrame:
+    final_df_x = r.clean_df
+    if final_df_x is None or final_df_x.empty:
+        raise ValueError(f"{label}: cleaned dataset is empty after QC.")
+
+    unit = st.session_state.get("result_unit", "").strip()
+    flags = st.session_state.get("preproc_flags", {})
+    qi_manual = st.session_state.get("qi_manual", None)
+
+    bivac_df = _build_qi_checklist(
+        r.preprocess_log,
+        r,
+        flags=flags,
+        qi_manual=qi_manual,
+        n_raw=len(raw_df),
+        n_kept=len(final_df_x),
+        unit=unit,
+    )
+    return bivac_df
+
 
 # ——————————————————————————————————————————————————————————————
 # 3-bis.  Braga–Panteghini flow-chart utilities
@@ -480,22 +753,58 @@ def _cochrans_test(variances: np.ndarray,
     G_crit = f_crit / (f_crit + (k - 1))
     return CochranResult(G > G_crit, G, G_crit)
 
-def _cochrans_test2(variances: np.ndarray,
-                   alpha: float = 0.05,
-                   df: int = 1) -> bool:
+
+def _detect_replicate_outliers(df: pd.DataFrame, alpha: float = 0.05) -> list[dict]:
     """
-    True  → largest variance is a Cochran outlier and must be rejected
-    False → no Cochran outlier detected.
+    Detect replicate-level Cochran outliers WITHOUT removing them.
+    Returns a list of dicts with outlier information for user selection.
+    
+    Each dict contains:
+        - Subject: subject ID
+        - Sample: sample ID  
+        - replicates: list of {Replicate, Result} dicts
+        - variance: the sample variance of the replicate set
+        - G: Cochran G statistic
+        - G_crit: Cochran critical value
     """
-    k = variances.size
-    if k < 2:
-        return False
-    G = variances.max() / variances.sum()
-    # critical limit from F-distribution (approximate Cochran)  :contentReference[oaicite:1]{index=1}
-    q        = 1 - alpha / k
-    f_crit   = f.ppf(q, 1, (k - 1) * df)
-    G_crit   = f_crit / (f_crit + (k - 1))
-    return G > G_crit
+    outliers = []
+    df_work = df.copy()
+    
+    while True:
+        rep_var = (df_work.groupby(["Subject", "Sample"])["Result"]
+                   .var(ddof=1).dropna())
+        
+        if rep_var.size < 3:
+            break
+        
+        R = (df_work.groupby(["Subject", "Sample"])["Replicate"]
+             .nunique().mode().iat[0])
+        
+        if R < 2:
+            break
+        
+        c_res = _cochrans_test(rep_var.values, alpha, df=R - 1)
+        
+        if not c_res.flag:
+            break
+        
+        subj, samp = rep_var.idxmax()
+        rep_data = df_work.loc[(df_work["Subject"] == subj) & (df_work["Sample"] == samp),
+                               ["Replicate", "Result"]].to_dict("records")
+        
+        outliers.append({
+            "Subject": subj,
+            "Sample": samp,
+            "replicates": rep_data,
+            "variance": float(rep_var.max()),
+            "G": float(c_res.G),
+            "G_crit": float(c_res.G_crit),
+        })
+        
+        # Remove this pair from working copy to find next outlier
+        df_work = df_work[~((df_work["Subject"] == subj) & (df_work["Sample"] == samp))]
+    
+    return outliers
 
 
 def _reed_outlier(values: np.ndarray) -> int | None:
@@ -596,7 +905,8 @@ def _preprocess_bv_dataframe(
         alpha: float = 0.05,
         normal_p: float = 0.05,
         enforce_balance: bool = True,
-        flags: dict[str, bool] | None = None,          #  NEW
+        flags: dict[str, bool] | None = None,
+        rep_outlier_selections: dict | None = None,  # user selections for replicate outliers
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
@@ -611,51 +921,110 @@ def _preprocess_bv_dataframe(
     ON     = lambda name: flags.get(name, True)   # helper: is this step enabled?
 
     # ════════════════════════════════════════════════════════════════════════
-    # 0.  Replicate‑set consistency  (QI 8a – Cochran variance test)
+    # 0.  Replicate‑set consistency  (QI 8a – Cochran variance test)
     #     • For every Subject‑×‑Sample pair we calculate the variance of its
     #       replicate measurements.
-    #     • Cochran’s C identifies the pair whose variance is disproportionately
-    #       large.  We iteratively remove offenders until the test is passed.
+    #     • Cochran's C identifies the pair whose variance is disproportionately
+    #       large.  User selections determine how to handle each outlier.
     # ════════════════════════════════════════════════════════════════════════
 
-    # ── QI 8a – replicate–set Cochran ──────────────────────────────────────────
+    # ── QI 8a – replicate–set Cochran ──────────────────────────────────────────
     if ON("rep_cochran"):
+        # If user has provided selections for detected outliers, apply them
+        rep_outlier_selections = rep_outlier_selections or {}
+        
+        # First apply user selections for detected outliers
+        for key, action in rep_outlier_selections.items():
+            subj, samp = key  # key is (Subject, Sample) tuple
+            mask = (df["Subject"] == subj) & (df["Sample"] == samp)
+            
+            if not mask.any():
+                continue  # Already removed or not in data
+            
+            vals = df.loc[mask, "Result"]
+            variance = df.loc[mask, "Result"].var(ddof=1)
+            
+            if action == "remove_all":
+                log.append(
+                    f"QI 8a – replicate Cochran outlier removed (user selection) → "
+                    f"Subject {subj}, Sample {samp}: "
+                    + ", ".join(f"{v:.2f}" for v in vals) +
+                    f"  (s² = {variance:.4f})"
+                )
+                df = df[~mask]
+            elif action == "ignore":
+                log.append(
+                    f"QI 8a – replicate Cochran outlier ignored (user selection) → "
+                    f"Subject {subj}, Sample {samp}: "
+                    + ", ".join(f"{v:.2f}" for v in vals) +
+                    f"  (s² = {variance:.4f}) – kept as-is"
+                )
+            elif action.startswith("keep_rep_"):
+                # Keep only the specified replicate
+                rep_to_keep = action.replace("keep_rep_", "")
+                # Try to convert to the same type as Replicate column
+                try:
+                    rep_to_keep = int(float(rep_to_keep))
+                except ValueError:
+                    pass  # Keep as string if conversion fails
+                
+                keep_mask = mask & (df["Replicate"] == rep_to_keep)
+                remove_mask = mask & (df["Replicate"] != rep_to_keep)
+                
+                removed_vals = df.loc[remove_mask, "Result"]
+                kept_val = df.loc[keep_mask, "Result"]
+                
+                log.append(
+                    f"QI 8a – replicate Cochran outlier: kept Replicate {rep_to_keep} (user selection) → "
+                    f"Subject {subj}, Sample {samp}: kept {kept_val.values[0]:.2f}, "
+                    f"removed {', '.join(f'{v:.2f}' for v in removed_vals)}"
+                )
+                df = df[~remove_mask]
+        
+        # Now run the standard Cochran test on remaining data for any new outliers
         while True:
             rep_var = (df.groupby(["Subject", "Sample"])["Result"]
                         .var(ddof=1).dropna())
+
             if rep_var.size < 3:
+                log.append("QI 8a – Cochran (replicate sets) skipped: <3 replicate-set variances available.")
                 break
 
             R = (df.groupby(["Subject", "Sample"])["Replicate"]
-                .nunique().mode().iat[0])          # current modal replicate count
+                .nunique().mode().iat[0])
+
+            if R < 2:
+                log.append("QI 8a – Cochran (replicate sets) skipped: only 1 replicate/sample.")
+                break
 
             c_res = _cochrans_test(rep_var.values, alpha, df=R - 1)
-            # ── NEW universal log line ──────────────────────────
+
             log.append(
-                f"QI 8a – Cochran (replicate sets): "
+                f"QI 8a – Cochran (replicate sets): "
                 f"G = {c_res.G:.3f}, Gcrit = {c_res.G_crit:.3f}"
                 + (" → OUTLIER" if c_res.flag else " → no outlier detected")
             )
 
-            if not c_res.flag:          # test passed → exit the loop
+            if not c_res.flag:
                 break
 
-            log.append(
-                f"QI 8a – Cochran test: G = {c_res.G:.3f}, "
-                f"Gcrit = {c_res.G_crit:.3f}"
-            )
-
+            # If there are still outliers and no user selection, auto-remove
             subj, samp = rep_var.idxmax()
+            if (subj, samp) in rep_outlier_selections:
+                # Already handled above, skip
+                break
+            
             vals = df.loc[(df["Subject"] == subj) & (df["Sample"] == samp), "Result"]
             log.append(
-                f"QI 8a – replicate Cochran outlier removed → "
+                f"QI 8a – replicate Cochran outlier removed → "
                 f"Subject {subj}, Sample {samp}: "
                 + ", ".join(f"{v:.2f}" for v in vals) +
                 f"  (s² = {rep_var.max():.4f})"
             )
             df = df[~((df["Subject"] == subj) & (df["Sample"] == samp))]
     else:
-        log.append("Replicate Cochran (QI 8a) skipped (switch off).")
+        log.append("Replicate Cochran (QI 8a) skipped (switch off).")
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # ❋ NEW: Bartlett's homogeneity test – analytic variance (replicates)
@@ -781,8 +1150,11 @@ def _preprocess_bv_dataframe(
                 + ", ".join(f"{v:.2f}" for v in vals) + ")"
             )
             df = df[~df["Subject"].eq(culprit)]
+            if removed_any:
+                log.append("QI 8c – Reed test complete: no further between-subject outliers.")
     else:
         log.append("Reed between‑subject (QI 8c) skipped (switch off).")
+
 
     # ════════════════════════════════════════════════════════════════════════
     # 0 b.  Steady‑state trend test (QI 7) – slope ± 95 % CI
@@ -968,11 +1340,35 @@ def _preprocess_bv_dataframe(
     # ════════════════════════════════════════════════════════════════════════
     # 4.  Force a perfectly balanced design (equal S & R)
     #     – required for the closed-form two-level ANOVA that follows
+    #     NOTE: We run sample-level (replicate) balance FIRST, then subject-level,
+    #           so that if a sample is removed due to unequal replicates, the
+    #           subject-level check will catch subjects with fewer samples.
     # ════════════════════════════════════════════════════════════════════════
     # ═════════ 4.  Force a perfectly balanced design ══════════════════════
     if enforce_balance:                                      # NEW GUARD
 
-        # 4-a ▸ SUBJECT-LEVEL balance  ───────────────────────────────────────────
+        # 4-a ▸ SAMPLE-LEVEL balance (replicate count) — RUN FIRST ─────────────
+        rep_cnt  = (df.groupby(["Subject", "Sample"])["Replicate"]
+                    .nunique()
+                    .reset_index(name="n"))
+        target_R = rep_cnt["n"].mode().iat[0] if not rep_cnt.empty else 0
+
+        bad_pairs = rep_cnt[rep_cnt["n"] != target_R]
+        if not bad_pairs.empty:
+            for _, row in bad_pairs.iterrows():
+                log.append(
+                    f"Balance check – Subject **{row.Subject}**, Sample **{row.Sample}** "
+                    f"has {row.n}/{target_R} replicate measurements; sample **removed**."
+                )
+            log.append(
+                f"{len(bad_pairs)} sample(s) discarded to enforce a uniform replicate "
+                f"count *R = {target_R}* across all remaining subjects."
+            )
+            bad_idx = df.set_index(["Subject", "Sample"]).index.isin(
+                bad_pairs.set_index(["Subject", "Sample"]).index)
+            df = df[~bad_idx]
+
+        # 4-b ▸ SUBJECT-LEVEL balance (sample count) — RUN AFTER ───────────────
         samp_cnt  = df.groupby("Subject")["Sample"].nunique()          # how many samples per subject
         target_S  = samp_cnt.mode().iat[0] if not samp_cnt.empty else 0
 
@@ -991,30 +1387,6 @@ def _preprocess_bv_dataframe(
 
         # retain only subjects with the correct sample count
         df = df[df["Subject"].isin(samp_cnt[samp_cnt == target_S].index)]
-
-        # 4-b ▸ SAMPLE-LEVEL balance  (replicate count)  ─────────────────────────
-        rep_cnt  = (df.groupby(["Subject", "Sample"])["Replicate"]
-                    .nunique()
-                    .reset_index(name="n"))
-        target_R = rep_cnt["n"].mode().iat[0] if not rep_cnt.empty else 0
-
-        bad_pairs = rep_cnt[rep_cnt["n"] != target_R]
-        if not bad_pairs.empty:
-            for _, row in bad_pairs.iterrows():
-                log.append(
-                    f"Balance check – Subject **{row.Subject}**, Sample **{row.Sample}** "
-                    f"has {row.n}/{target_R} replicate measurements; sample **removed**."
-                )
-            log.append(
-                f"{len(bad_pairs)} sample(s) discarded to enforce a uniform replicate "
-                f"count *R = {target_R}* across all remaining subjects."
-            )
-
-        if not bad_pairs.empty:
-            bad_idx = df.set_index(["Subject", "Sample"]).index.isin(
-                bad_pairs.set_index(["Subject", "Sample"]).index)
-            df = df[~bad_idx]
-
 
         # 4-c.  final sanity check
         I_fin = df["Subject"].nunique()
@@ -1364,7 +1736,8 @@ def _calculate_bv_unbalanced(df: pd.DataFrame,
 
 def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
                  use_cv_anova: bool = False,
-                 enforce_balance: bool = True        # NEW PARAM
+                 enforce_balance: bool = True,
+                 rep_outlier_selections: dict | None = None,  # user selections for replicate outliers
 ) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
@@ -1375,6 +1748,9 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
         Extra columns are ignored. Capitalisation is normalised.
     alpha : float
         Significance level for the CI on CV_I (0.05 → 95 % CI).
+    rep_outlier_selections : dict | None
+        User selections for how to handle detected replicate outliers.
+        Keys are (Subject, Sample) tuples, values are actions like "remove_all", "ignore", or "keep_rep_N".
     """
 
     
@@ -1393,7 +1769,12 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
     # 3.1  apply Braga–Panteghini outlier/normality pipeline  
     try:
         df, pp_log = _preprocess_bv_dataframe(
-            df, alpha=alpha, enforce_balance=enforce_balance, flags=st.session_state.get("preproc_flags"))   # NEW ARG
+            df, 
+            alpha=alpha, 
+            enforce_balance=enforce_balance, 
+            flags=st.session_state.get("preproc_flags"),
+            rep_outlier_selections=rep_outlier_selections,
+        )
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
         raise PreprocessError(str(e), e.log) from None
@@ -1455,8 +1836,9 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             rcv_95_down = ub["rcv_down"],
             rcv_95_up   = ub["rcv_up"],
             preprocess_log = pp_log,
+            clean_df=df.copy(),   # NEW
             cv_I_cv_anova = cv_anova,               
-            ci_cv_I_cv_anova = ci_cv_anova          
+            ci_cv_I_cv_anova = ci_cv_anova,   
         )
 
 
@@ -1576,6 +1958,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             ci_cv_A,          # add here
             ci_cv_I, ci_cv_G, rcv_down, rcv_up,
             preprocess_log = pp_log,
+            clean_df=df.copy(),   # NEW
             cv_I_cv_anova = cv_anova,
             ci_cv_I_cv_anova = ci_cv_anova,
         )
@@ -1708,6 +2091,104 @@ with pd.ExcelWriter(_template_xlsx_io, engine="openpyxl") as xl_writer:
     _template_df.to_excel(xl_writer, sheet_name="Template", index=False)
 _template_xlsx_io.seek(0)  # reset file pointer for download
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gender-based analysis helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _enforce_subject_level_gender(df_gender: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Ensure each Subject has exactly one gender label across all its rows.
+    Drop subjects with missing/ambiguous/mixed gender.
+    """
+    glog = []
+
+    uniq = df_gender.groupby("Subject")["Gender"].apply(lambda s: list(pd.unique(s.dropna())))
+    good = uniq[uniq.apply(len) == 1]
+    bad  = uniq[uniq.apply(len) != 1]
+
+    if len(bad):
+        glog.append(f"Gender mapping: excluded {len(bad)} subject(s) with missing/ambiguous/mixed gender.")
+
+    keep_ids = set(good.index)
+    out = df_gender[df_gender["Subject"].isin(keep_ids)].copy()
+    subj_to_gender = {sid: genders[0] for sid, genders in good.items()}
+    out["Gender"] = out["Subject"].map(subj_to_gender)
+    return out, glog
+
+def ci_overlaps(ci1: tuple[float, float], ci2: tuple[float, float]) -> bool:
+    """True if two closed intervals overlap (touching counts as overlap)."""
+    if ci1 is None or ci2 is None:
+        return True
+    lo = max(float(ci1[0]), float(ci2[0]))
+    hi = min(float(ci1[1]), float(ci2[1]))
+    return lo <= hi
+
+def _derive_gender_single_column(raw_df: pd.DataFrame,
+                                gender_col: str,
+                                male_value,
+                                female_value) -> pd.Series:
+    """Map a single gender column into canonical labels: 'Male'/'Female'/NaN."""
+    s = raw_df[gender_col]
+    g = pd.Series(index=raw_df.index, dtype="object")
+    g.loc[s == male_value] = "Male"
+    g.loc[s == female_value] = "Female"
+    return g
+
+def _derive_gender_two_indicators(raw_df: pd.DataFrame,
+                                 male_col: str,
+                                 female_col: str) -> pd.Series:
+    """
+    Map two indicator columns into canonical labels.
+    Truthiness rule: nonzero/True => indicator set.
+    Ambiguous (both True or both False/NA) => NaN.
+    """
+    m = raw_df[male_col].fillna(0)
+    f = raw_df[female_col].fillna(0)
+
+    m_true = m.astype(bool)
+    f_true = f.astype(bool)
+
+    g = pd.Series(index=raw_df.index, dtype="object")
+    g.loc[m_true & ~f_true] = "Male"
+    g.loc[f_true & ~m_true] = "Female"
+    # ambiguous stays NaN
+    return g
+
+def _pick_cvi_ci(res: BVResult, use_cv_anova_flag: bool) -> tuple[float, tuple[float, float]]:
+    """
+    Decide which CVI value/CI is “the CVI” for overlap decisions.
+    If CV-ANOVA is selected AND available, use that; otherwise use standard ANOVA.
+    """
+    if use_cv_anova_flag and (res.cv_I_cv_anova is not None) and (res.ci_cv_I_cv_anova is not None):
+        return float(res.cv_I_cv_anova), tuple(res.ci_cv_I_cv_anova)
+    return float(res.cv_I), tuple(res.ci_cv_I)
+
+def _render_gender_overlap_recommendations(res_m: BVResult, res_f: BVResult, use_cv_anova_flag: bool):
+    # CVI overlap check
+    _, cvi_ci_m = _pick_cvi_ci(res_m, use_cv_anova_flag)
+    _, cvi_ci_f = _pick_cvi_ci(res_f, use_cv_anova_flag)
+
+    if not ci_overlaps(cvi_ci_m, cvi_ci_f):
+        st.warning(
+            "✅ **Gender-based recommendation (CVI):** CVI 95% CIs **do NOT overlap** between genders. "
+            "**Report CVI separately** for Male and Female."
+        )
+    else:
+        st.info(
+            "CVI 95% CIs **overlap** between genders → separate CVI reporting is not required."
+        )
+
+    # Mean overlap check (drives CVG recommendation per your requirement)
+    if not ci_overlaps(res_m.ci_mean, res_f.ci_mean):
+        st.warning(
+            "✅ **Gender-based recommendation (CVG):** Mean concentration 95% CIs **do NOT overlap** between genders. "
+            "**Report CVG separately** for Male and Female."
+        )
+    else:
+        st.info(
+            "Mean concentration 95% CIs **overlap** between genders → separate CVG reporting is not required."
+        )
+
+
 # ——————————————————————————————————————————————————————————————
 # 6.  Streamlit user interface
 # ——————————————————————————————————————————————————————————————
@@ -1832,8 +2313,8 @@ with instr_tab:
             """
         )
 
-        st.markdown("### Recommended study design")
-        st.info("**≥20 subjects**, **≥3 samples/subject**, **≥2 replicates/sample** is a good starting point.", icon="✅")
+        # st.markdown("### Recommended study design")
+        # st.info("**≥20 subjects**, **≥3 samples/subject**, **≥2 replicates/sample** is a good starting point.", icon="✅")
     st.info("**When using BIVAC, please cite the following reference:** *Aarsand AK, Røraas T, Fernandez-Calle P, Ricos C, Díaz-Garzón J, Jonker N, Perich C, González-Lao E, Carobene A, Minchinela J, Coşkun A, Simón M, Álvarez V, Bartlett WA, Fernández-Fernández P, Boned B, Braga F, Corte Z, Aslan B, Sandberg S; European Federation of Clinical Chemistry and Laboratory Medicine Working Group on Biological Variation and Task and Finish Group for the Biological Variation Database. The Biological Variation Data Critical Appraisal Checklist: A Standard for Evaluating Studies on Biological Variation. Clin Chem. 2018 Mar;64(3):501-514. doi: 10.1373/clinchem.2017.281808. Epub 2017 Dec 8. PMID: 29222339.*")
     st.info("**To report biological variation data appropriately, please refer:** *Bartlett WA, Sandberg S, Carobene A, Fernandez-Calle P, Diaz-Garzon J, Coskun A, Jonker N, Galior K, Gonzales-Lao E, Moreno-Parro I, Sufrate-Vergara B, Webster C, Itkonen O, Marques-García F, Aarsand AK. A standard to report biological variation data studies - based on an expert opinion. Clin Chem Lab Med. 2024 Jul 8;63(1):52-59. doi: 10.1515/cclm-2024-0489. PMID: 38965828.*")
 
@@ -2050,8 +2531,288 @@ if user_df is not None:
     estimate_cv_anova = st.checkbox("Estimate CVI with CV-ANOVA")
     st.session_state["use_cv_anova"] = estimate_cv_anova
 
-    # NEW: disable Calculate until mapping_ok
-    calc_disabled = not st.session_state.get("mapping_ok", False)
+    # ─────────────────────────────────────────────────────────────
+    # Replicate-level outlier detection and user selection UI
+    # ─────────────────────────────────────────────────────────────
+    if st.session_state.get("mapping_ok", False) and st.session_state.get("preproc_flags", {}).get("rep_cochran", True):
+        mapped_df = st.session_state.get("mapped_df")
+        if mapped_df is not None and not mapped_df.empty:
+            # Detect replicate-level outliers
+            detected_outliers = _detect_replicate_outliers(mapped_df.copy())
+            
+            if detected_outliers:
+                st.markdown("---")
+                st.subheader("🔍 Replicate-level Outliers Detected (QI 8a)")
+                st.markdown(
+                    "The following Subject×Sample pairs have **unusually high replicate variance** "
+                    "(Cochran's test). Choose how to handle each:"
+                )
+                
+                # Initialize selection storage if not present
+                if "rep_outlier_selections" not in st.session_state:
+                    st.session_state["rep_outlier_selections"] = {}
+                
+                for i, outlier in enumerate(detected_outliers):
+                    subj = outlier["Subject"]
+                    samp = outlier["Sample"]
+                    variance = outlier["variance"]
+                    reps = outlier["replicates"]
+                    
+                    with st.expander(
+                        f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
+                        f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
+                        expanded=True
+                    ):
+                        # Show replicate values as a small table
+                        rep_df = pd.DataFrame(reps)
+                        st.dataframe(rep_df, use_container_width=True, hide_index=True)
+                        
+                        # Build options
+                        options = ["🗑️ Remove entire sample (default)"]
+                        for r in reps:
+                            options.append(
+                                f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})"
+                            )
+                        options.append("⏩ Keep all (ignore outlier)")
+                        
+                        # Get stored selection or default
+                        key = (subj, samp)
+                        stored_idx = 0
+                        if key in st.session_state.get("rep_outlier_selections", {}):
+                            stored_action = st.session_state["rep_outlier_selections"][key]
+                            if stored_action == "remove_all":
+                                stored_idx = 0
+                            elif stored_action == "ignore":
+                                stored_idx = len(options) - 1
+                            elif stored_action.startswith("keep_rep_"):
+                                rep_id = stored_action.replace("keep_rep_", "")
+                                for j, r in enumerate(reps):
+                                    if str(r["Replicate"]) == rep_id:
+                                        stored_idx = j + 1
+                                        break
+                        
+                        selected = st.radio(
+                            "Action:",
+                            options,
+                            index=stored_idx,
+                            key=f"rep_outlier_action_{i}_{subj}_{samp}",
+                            horizontal=False
+                        )
+                        
+                        # Map selection to action string
+                        if selected.startswith("🗑️"):
+                            action = "remove_all"
+                        elif selected.startswith("⏩"):
+                            action = "ignore"
+                        else:
+                            # Extract replicate number from selection
+                            for r in reps:
+                                if f"Replicate {r['Replicate']}" in selected:
+                                    action = f"keep_rep_{r['Replicate']}"
+                                    break
+                        
+                        st.session_state["rep_outlier_selections"][key] = action
+                
+                st.markdown("---")
+            else:
+                # Clear any stale selections if no outliers detected
+                st.session_state["rep_outlier_selections"] = {}
+        else:
+            st.session_state["rep_outlier_selections"] = {}
+    else:
+        # Clear selections if Cochran is disabled
+        st.session_state["rep_outlier_selections"] = {}
+
+    # ─────────────────────────────────────────────────────────────
+    # Gender-based calculations UI
+    # ─────────────────────────────────────────────────────────────
+    gender_based = st.checkbox("Gender based calculations", value=False)
+    st.session_state["gender_based"] = gender_based
+
+    gender_settings_ok = True
+    if gender_based:
+        st.markdown("### Gender mapping")
+
+        cols_all = list(user_df.columns)  # raw dataset columns
+
+        gender_mode = st.radio(
+            "How is gender encoded in your dataset?",
+            ["Single gender column", "Two indicator columns (Male/Female)"],
+            horizontal=True
+        )
+        st.session_state["gender_mode"] = gender_mode
+
+        if gender_mode == "Single gender column":
+            gender_col = st.selectbox("Gender column", cols_all, index=0)
+            # Pull unique values for easy mapping
+            uniq = pd.Series(user_df[gender_col]).dropna().unique().tolist()
+            if len(uniq) == 0:
+                st.error("Selected gender column has no values.")
+                gender_settings_ok = False
+            else:
+                male_value = st.selectbox("Which variable means **Male**?", uniq, index=0)
+                # Try to pick a different default for female if possible
+                f_index = 1 if len(uniq) > 1 else 0
+                female_value = st.selectbox("Which variable means **Female**?", uniq, index=f_index)
+
+                if male_value == female_value:
+                    st.error("Male and Female values must be different.")
+                    gender_settings_ok = False
+
+                st.session_state["gender_col"] = gender_col
+                st.session_state["male_value"] = male_value
+                st.session_state["female_value"] = female_value
+
+        else:
+            male_col = st.selectbox("Male indicator column", cols_all, index=0)
+            female_col = st.selectbox("Female indicator column", cols_all, index=min(1, len(cols_all)-1))
+
+            if male_col == female_col:
+                st.error("Male and Female indicator columns must be different.")
+                gender_settings_ok = False
+
+            st.session_state["male_col"] = male_col
+            st.session_state["female_col"] = female_col
+
+        st.caption(
+            "Rows that cannot be mapped unambiguously to Male/Female (e.g., missing/unknown/both indicators) "
+            "will be excluded **only for gender-split analysis**."
+        )
+
+    st.session_state["gender_settings_ok"] = gender_settings_ok
+
+    # ─────────────────────────────────────────────────────────────
+    # Gender-specific replicate outlier detection UI
+    # ─────────────────────────────────────────────────────────────
+    if (gender_based and gender_settings_ok and 
+        st.session_state.get("mapping_ok", False) and 
+        st.session_state.get("preproc_flags", {}).get("rep_cochran", True)):
+        
+        mapped_df = st.session_state.get("mapped_df")
+        if mapped_df is not None and not mapped_df.empty:
+            # Build gender-split datasets
+            df_with_gender = mapped_df.copy()
+            mode = st.session_state.get("gender_mode", "Single gender column")
+            
+            if mode == "Single gender column":
+                gcol = st.session_state.get("gender_col")
+                mv = st.session_state.get("male_value")
+                fv = st.session_state.get("female_value")
+                if gcol and gcol in user_df.columns:
+                    df_with_gender["Gender"] = _derive_gender_single_column(user_df, gcol, mv, fv)
+            else:
+                mcol = st.session_state.get("male_col")
+                fcol = st.session_state.get("female_col")
+                if mcol and fcol and mcol in user_df.columns and fcol in user_df.columns:
+                    df_with_gender["Gender"] = _derive_gender_two_indicators(user_df, mcol, fcol)
+            
+            if "Gender" in df_with_gender.columns:
+                male_df = df_with_gender[df_with_gender["Gender"] == "Male"].drop(columns=["Gender"]).copy()
+                female_df = df_with_gender[df_with_gender["Gender"] == "Female"].drop(columns=["Gender"]).copy()
+                
+                # Initialize gender-specific selection storage
+                if "rep_outlier_selections_male" not in st.session_state:
+                    st.session_state["rep_outlier_selections_male"] = {}
+                if "rep_outlier_selections_female" not in st.session_state:
+                    st.session_state["rep_outlier_selections_female"] = {}
+                
+                # Detect outliers for Male
+                if not male_df.empty:
+                    male_outliers = _detect_replicate_outliers(male_df)
+                    if male_outliers:
+                        st.markdown("---")
+                        st.subheader("🔍 Male: Replicate-level Outliers (QI 8a)")
+                        for i, outlier in enumerate(male_outliers):
+                            subj, samp = outlier["Subject"], outlier["Sample"]
+                            variance, reps = outlier["variance"], outlier["replicates"]
+                            with st.expander(
+                                f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
+                                f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
+                                expanded=True
+                            ):
+                                st.dataframe(pd.DataFrame(reps), use_container_width=True, hide_index=True)
+                                options = ["🗑️ Remove entire sample (default)"]
+                                for r in reps:
+                                    options.append(f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})")
+                                options.append("⏩ Keep all (ignore outlier)")
+                                
+                                key = (subj, samp)
+                                stored_idx = 0
+                                if key in st.session_state.get("rep_outlier_selections_male", {}):
+                                    stored_action = st.session_state["rep_outlier_selections_male"][key]
+                                    if stored_action == "remove_all": stored_idx = 0
+                                    elif stored_action == "ignore": stored_idx = len(options) - 1
+                                    elif stored_action.startswith("keep_rep_"):
+                                        for j, r in enumerate(reps):
+                                            if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                stored_idx = j + 1; break
+                                
+                                selected = st.radio("Action:", options, index=stored_idx,
+                                    key=f"male_outlier_{i}_{subj}_{samp}", horizontal=False)
+                                
+                                if selected.startswith("🗑️"): action = "remove_all"
+                                elif selected.startswith("⏩"): action = "ignore"
+                                else:
+                                    for r in reps:
+                                        if f"Replicate {r['Replicate']}" in selected:
+                                            action = f"keep_rep_{r['Replicate']}"; break
+                                st.session_state["rep_outlier_selections_male"][key] = action
+                    else:
+                        st.session_state["rep_outlier_selections_male"] = {}
+                
+                # Detect outliers for Female
+                if not female_df.empty:
+                    female_outliers = _detect_replicate_outliers(female_df)
+                    if female_outliers:
+                        st.markdown("---")
+                        st.subheader("🔍 Female: Replicate-level Outliers (QI 8a)")
+                        for i, outlier in enumerate(female_outliers):
+                            subj, samp = outlier["Subject"], outlier["Sample"]
+                            variance, reps = outlier["variance"], outlier["replicates"]
+                            with st.expander(
+                                f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
+                                f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
+                                expanded=True
+                            ):
+                                st.dataframe(pd.DataFrame(reps), use_container_width=True, hide_index=True)
+                                options = ["🗑️ Remove entire sample (default)"]
+                                for r in reps:
+                                    options.append(f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})")
+                                options.append("⏩ Keep all (ignore outlier)")
+                                
+                                key = (subj, samp)
+                                stored_idx = 0
+                                if key in st.session_state.get("rep_outlier_selections_female", {}):
+                                    stored_action = st.session_state["rep_outlier_selections_female"][key]
+                                    if stored_action == "remove_all": stored_idx = 0
+                                    elif stored_action == "ignore": stored_idx = len(options) - 1
+                                    elif stored_action.startswith("keep_rep_"):
+                                        for j, r in enumerate(reps):
+                                            if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                stored_idx = j + 1; break
+                                
+                                selected = st.radio("Action:", options, index=stored_idx,
+                                    key=f"female_outlier_{i}_{subj}_{samp}", horizontal=False)
+                                
+                                if selected.startswith("🗑️"): action = "remove_all"
+                                elif selected.startswith("⏩"): action = "ignore"
+                                else:
+                                    for r in reps:
+                                        if f"Replicate {r['Replicate']}" in selected:
+                                            action = f"keep_rep_{r['Replicate']}"; break
+                                st.session_state["rep_outlier_selections_female"][key] = action
+                    else:
+                        st.session_state["rep_outlier_selections_female"] = {}
+                
+                st.markdown("---")
+    else:
+        # Clear gender-specific selections if not applicable
+        st.session_state["rep_outlier_selections_male"] = {}
+        st.session_state["rep_outlier_selections_female"] = {}    # NEW: disable Calculate until mapping_ok
+    calc_disabled = (not st.session_state.get("mapping_ok", False)) or (
+        st.session_state.get("gender_based", False) and (not st.session_state.get("gender_settings_ok", True))
+    )
+
     if calc_disabled:
         st.info("Save a valid column mapping above to enable **Calculate**.")
 
@@ -2068,158 +2829,527 @@ if user_df is not None:
                 res = calculate_bv(
                     df_for_calc,
                     use_cv_anova=st.session_state.get("use_cv_anova", False),
-                    enforce_balance = st.session_state.get("enforce_balance", True)   # NEW
+                    enforce_balance=st.session_state.get("enforce_balance", True),
+                    rep_outlier_selections=st.session_state.get("rep_outlier_selections", {}),
                 )
+                # ─────────────────────────────────────────────────────────────
+                # --- Gender-split calculations (run the same pipeline per gender) ---
+                res_male = res_female = None
+                male_df_final = female_df_final = None
+
+                if gender_based:
+                    df_gender = df_for_calc.copy()
+
+                    mode = st.session_state.get("gender_mode", "Single gender column")
+                    if mode == "Single gender column":
+                        gcol = st.session_state["gender_col"]
+                        mv = st.session_state["male_value"]
+                        fv = st.session_state["female_value"]
+                        df_gender["Gender"] = _derive_gender_single_column(user_df, gcol, mv, fv)
+                    else:
+                        mcol = st.session_state["male_col"]
+                        fcol = st.session_state["female_col"]
+                        df_gender["Gender"] = _derive_gender_two_indicators(user_df, mcol, fcol)
+
+                    # keep only clear Male/Female rows
+                    df_gender = df_gender[df_gender["Gender"].isin(["Male", "Female"])].copy()
+
+                    # enforce one gender per subject
+                    df_gender, g_log = _enforce_subject_level_gender(df_gender)
+                    for ln in g_log:
+                        st.info(ln)
+
+                    n_m = int((df_gender["Gender"] == "Male").sum())
+                    n_f = int((df_gender["Gender"] == "Female").sum())
+                    st.divider()
+                    st.write(f"**Gender split rows available:** Male = {n_m}, Female = {n_f}")
+
+                    if (n_m == 0) or (n_f == 0):
+                        st.error("Gender-based calculations enabled, but one gender group has 0 usable rows after mapping.")
+                    else:
+                        use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
+                        enforce_balance_flag = st.session_state.get("enforce_balance", True)
+
+                        # (optional but recommended) drop Gender column before BV calc
+                        male_input = df_gender[df_gender["Gender"] == "Male"].drop(columns=["Gender"])
+                        female_input = df_gender[df_gender["Gender"] == "Female"].drop(columns=["Gender"])
+
+                        try:
+                            res_male = calculate_bv(
+                                male_input,
+                                use_cv_anova=use_cv_anova_flag,
+                                enforce_balance=enforce_balance_flag,
+                                rep_outlier_selections=st.session_state.get("rep_outlier_selections_male", {}),
+                            )
+                            male_df_final = res_male.clean_df
+                        except Exception as e:
+                            st.error(f"Male calculation failed: {e}")
+
+                        try:
+                            res_female = calculate_bv(
+                                female_input,
+                                use_cv_anova=use_cv_anova_flag,
+                                enforce_balance=enforce_balance_flag,
+                                rep_outlier_selections=st.session_state.get("rep_outlier_selections_female", {}),
+                            )
+                            female_df_final = res_female.clean_df
+                        except Exception as e:
+                            st.error(f"Female calculation failed: {e}")
+
+                # ─────────────────────────────────────────────────────────────
+                # Group registry for gender-based rendering
+                # ─────────────────────────────────────────────────────────────
+                groups: dict[str, tuple[BVResult, pd.DataFrame]] = {"Overall": (res, df_for_calc)}
+
+                if st.session_state.get("gender_based", False) and (res_male is not None) and (res_female is not None):
+                    groups["Male"] = (res_male, male_input)
+                    groups["Female"] = (res_female, female_input)
+
+                unit = st.session_state.get("result_unit", "").strip()
+                use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
+                flags = st.session_state.get("preproc_flags", {})
+                qi_manual = st.session_state.get("qi_manual")
+
+
+                # ─────────────────────────────────────────────────────────────
+                # Gender-based reporting tables (minimal, no rewrite of your UI cards)
+                # ─────────────────────────────────────────────────────────────
+                if st.session_state.get("gender_based", False) and (res_male is not None) and (res_female is not None):
+
+                    use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
+                    unit = st.session_state.get("result_unit", "").strip()
+
+                    def _one_row(label: str, r: BVResult) -> dict:
+                        # --- Standard ANOVA CVI (always available) ---
+                        cvi_std_val = float(r.cv_I)
+                        cvi_std_ci  = tuple(r.ci_cv_I)
+
+                        # --- CV-ANOVA CVI (optional) ---
+                        if (r.cv_I_cv_anova is not None) and (r.ci_cv_I_cv_anova is not None):
+                            cvi_cva_val = float(r.cv_I_cv_anova)
+                            cvi_cva_ci  = tuple(r.ci_cv_I_cv_anova)
+                            cvi_cva_txt = f"{cvi_cva_val:.2f} ({cvi_cva_ci[0]:.2f}–{cvi_cva_ci[1]:.2f})"
+                        else:
+                            cvi_cva_txt = "—"  # or "Not computed"
+
+                        return {
+                            "Gender": label,
+                            "Mean concentration (95% CI)": f"{r.grand_mean:.2f}" + (f" {unit} " if unit else "") + f"({r.ci_mean[0]:.2f}–{r.ci_mean[1]:.2f})" + (f" {unit}" if unit else ""),
+                            #"Mean CI (95%)": f"{r.ci_mean[0]:.2f}–{r.ci_mean[1]:.2f}" + (f" {unit}" if unit else ""),
+                            "CVA % (95% CI)": f"{r.cv_A:.2f} ({r.ci_cv_A[0]:.2f}–{r.ci_cv_A[1]:.2f})",
+
+                            # ✅ NEW: both CVIs as separate columns
+                            "CVI (based on standard ANOVA) (95% CI)": f"{cvi_std_val:.2f} ({cvi_std_ci[0]:.2f}–{cvi_std_ci[1]:.2f})",
+                            "CVI (based on CV-ANOVA) (95% CI)": cvi_cva_txt,
+
+                            "CVG % (95% CI)": f"{r.cv_G:.2f} ({r.ci_cv_G[0]:.2f}–{r.ci_cv_G[1]:.2f})",
+                            "RCV (95%)": f"−{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%",
+                        }
+
+
+
+                    # ✅ NOW show recommendations AFTER the tables/plots
+                    st.divider()
+                    st.subheader("Gender-based reporting recommendations")
+
+                    # Optional plots per gender (only if we successfully built final cleaned dfs)
+                    tabs = st.tabs(["Male plot", "Female plot"])
+                    with tabs[0]:
+                        if male_df_final is not None and not male_df_final.empty:
+                            st.plotly_chart(plot_subject_ranges(male_df_final), use_container_width=True)
+                        else:
+                            st.info("Male plot not available (cleaned dataset empty or failed).")
+                    with tabs[1]:
+                        if female_df_final is not None and not female_df_final.empty:
+                            st.plotly_chart(plot_subject_ranges(female_df_final), use_container_width=True)
+                        else:
+                            st.info("Female plot not available (cleaned dataset empty or failed).")
+
+
+                    #st.subheader("Gender-based BV results (side-by-side)")
+                    gender_tbl = pd.DataFrame([
+                        _one_row("Male", res_male),
+                        _one_row("Female", res_female),
+                    ])
+                    # ✅ Rename columns to HTML subscript notation (uppercase A/I/G)
+                    gender_tbl_disp = gender_tbl.rename(columns={
+                        "CVA % (95% CI)": "CV<sub>A</sub> % (95% CI)",
+                        "CVI (based on standard ANOVA) (95% CI)": "CV<sub>I</sub> (based on standard ANOVA) (95% CI)",
+                        "CVI (based on CV-ANOVA) (95% CI)": "CV<sub>I</sub> (based on CV-ANOVA) (95% CI)",
+                        "CVG % (95% CI)": "CV<sub>G</sub> % (95% CI)",
+                    })
+
+                    # ✅ Render as HTML so <sub> works in headers; hide index
+                    gender_html = (
+                        gender_tbl_disp.style
+                            .set_table_styles([
+                                {
+                                    "selector": "th",
+                                    "props": [
+                                        ("background-color", "#d0e7f5"),
+                                        ("color", "#1e3a5f"),
+                                        ("font-weight", "700"),
+                                        ("text-align", "left"),
+                                    ],
+                                },
+                                {"selector": "td", "props": [("text-align", "left")]},
+                            ])
+                            .hide(axis="index")
+                            .to_html(index=False, escape=False)   # escape=False allows <sub> to render
+                    )
+
+                    st.markdown(gender_html, unsafe_allow_html=True)
+
+                    with st.expander("Gender-based reporting recommendations", expanded=True):
+                        _render_gender_overlap_recommendations(res_male, res_female, use_cv_anova_flag)
+                    st.divider()
+
+
+                # ─────────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────────────────────
+                # Gender-aware render helpers (Key metrics / Summary / APS / BIVAC)
+                # ─────────────────────────────────────────────────────────────
+
+                def _fmt_ci(ci: tuple[float, float] | None, suffix: str = "") -> str:
+                    if not ci:
+                        return ""
+                    lo, hi = float(ci[0]), float(ci[1])
+                    return f"{lo:.2f}–{hi:.2f}{suffix}"
+
+                def _fmt_count(x) -> str:
+                    if x is None:
+                        return ""
+                    try:
+                        xf = float(x)
+                        return str(int(xf)) if xf.is_integer() else f"{xf:.2f}"
+                    except Exception:
+                        return str(x)
+
+                def _pick_cvi_for_table(r: BVResult, use_cv_anova_flag: bool):
+                    """Return (label, value, ci) for CVI row."""
+                    if use_cv_anova_flag and (r.cv_I_cv_anova is not None) and (r.ci_cv_I_cv_anova is not None):
+                        return "CVI (CV-ANOVA) (%)", float(r.cv_I_cv_anova), tuple(r.ci_cv_I_cv_anova)
+                    return "CVI (standard ANOVA) (%)", float(r.cv_I), tuple(r.ci_cv_I)
+
+                def _build_study_design_table(r: BVResult) -> pd.DataFrame:
+                    # If unbalanced, S/R may be mean values (floats). Label accordingly.
+                    try:
+                        s_is_int = float(r.S).is_integer()
+                        r_is_int = float(r.R).is_integer()
+                    except Exception:
+                        s_is_int = r_is_int = True
+
+                    s_label = "Samples per subject (S)" if s_is_int else "Samples per subject (mean S̄)"
+                    r_label = "Replicates per sample (R)" if r_is_int else "Replicates per sample (mean R̄)"
+
+                    rows = [
+                        {"Parameter": "Number of subjects (I)", "Value": _fmt_count(r.I)},
+                        {"Parameter": s_label,                 "Value": _fmt_count(r.S)},
+                        {"Parameter": r_label,                 "Value": _fmt_count(r.R)},
+                    ]
+                    return pd.DataFrame(rows)
+
+                def _build_core_estimates_table(r: BVResult, unit: str, use_cv_anova_flag: bool) -> pd.DataFrame:
+                    unit_txt = f" {unit}" if unit else ""
+
+                    rows = [
+                        {
+                            "Parameter": f"Mean concentration {unit_txt}",
+                            "Value": f"{r.grand_mean:.2f} {unit_txt}",
+                            "CI (95%)": _fmt_ci(r.ci_mean, unit_txt),
+                        },
+                        {
+                            "Parameter": "Analytical CV (%)",
+                            "Value": f"{r.cv_A:.2f} %",
+                            "CI (95%)": _fmt_ci(r.ci_cv_A, " %"),
+                        },
+
+                        # ✅ Always show standard ANOVA CVI
+                        {
+                            "Parameter": "Within-subject CV (based on standard ANOVA) (%)",
+                            "Value": f"{float(r.cv_I):.2f} %",
+                            "CI (95%)": _fmt_ci(tuple(r.ci_cv_I), " %"),
+                        },
+                    ]
+
+                    # ✅ Also show CV-ANOVA CVI (if computed), otherwise show placeholder
+                    if (r.cv_I_cv_anova is not None) and (r.ci_cv_I_cv_anova is not None):
+                        rows.append({
+                            "Parameter": "Within-subject CV (based on CV-ANOVA) (%)",
+                            "Value": f"{float(r.cv_I_cv_anova):.2f} %",
+                            "CI (95%)": _fmt_ci(tuple(r.ci_cv_I_cv_anova), " %"),
+                        })
+                    else:
+                        rows.append({
+                            "Parameter": "Within-subject CV (based on CV-ANOVA) (%)",
+                            "Value": "—",
+                            "CI (95%)": "—" if use_cv_anova_flag else "Not computed (enable “Estimate CVI with CV-ANOVA”).",
+                        })
+
+                    # remaining rows
+                    rows += [
+                        {
+                            "Parameter": "Between-subject CV (%)",
+                            "Value": f"{r.cv_G:.2f} %",
+                            "CI (95%)": _fmt_ci(r.ci_cv_G, " %"),
+                        },
+                        {
+                            "Parameter": "Reference change value (95%) (lognormal)",
+                            "Value": f"−{r.rcv_95_down:.2f} % / +{r.rcv_95_up:.2f} %",
+                            "CI (95%)": "",
+                        },
+                    ]
+
+                    return pd.DataFrame(rows)
+
+
+
+                def _render_key_metrics_table(label: str, r: BVResult, unit: str, use_cv_anova_flag: bool):
+                    st.markdown(f"### {label}")
+
+                    # Build the two tables
+                    design_df = _build_study_design_table(r)
+                    core_df   = _build_core_estimates_table(r, unit, use_cv_anova_flag)
+
+                    # Common style (matches your current header theme)
+                    hdr_style = [{
+                        "selector": "th",
+                        "props": [
+                            ("background-color", "#d0e7f5"),
+                            ("color", "#1e3a5f"),
+                            ("font-size", "0.9rem"),
+                        ],
+                    }]
+
+                    st.markdown("#### Study design")
+                    st.dataframe(
+                        design_df.style
+                            .set_table_styles(hdr_style)
+                            .set_properties(**{"font-size": "0.9rem"})
+                            .set_properties(subset=["Parameter"], **{"font-weight": "700"}),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    st.markdown("#### Core estimates")
+                    st.dataframe(
+                        core_df.style
+                            .set_table_styles(hdr_style)
+                            .set_properties(**{"font-size": "0.9rem"})
+                            .set_properties(subset=["Parameter"], **{"font-weight": "700"}),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # Optional note for unbalanced runs
+                    try:
+                        if (not float(r.S).is_integer()) or (not float(r.R).is_integer()):
+                            st.caption("Note: Unbalanced design → S̄ and/or R̄ are reported as mean values.")
+                    except Exception:
+                        pass
+
+
+
+                def _render_key_metrics_section(r: BVResult, unit: str, use_cv_anova_flag: bool):
+                    # Build the metrics list (same as your overall)
+                    metrics = [
+                        ("Mean (CI)",
+                        f"{r.grand_mean:.2f}" + (f" {unit}" if unit else ""),
+                        f"({r.ci_mean[0]:.2f}–{r.ci_mean[1]:.2f})" + (f" {unit}" if unit else "")),
+                        ("CV<sub>A</sub> (CI%)",
+                        f"{r.cv_A:.2f}",
+                        f"({r.ci_cv_A[0]:.2f}–{r.ci_cv_A[1]:.2f})"),
+                        ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span> (CI%)",
+                        f"{r.cv_I:.2f}",
+                        f"({r.ci_cv_I[0]:.2f}–{r.ci_cv_I[1]:.2f})"),
+                        ("CV<sub>G</sub> (CI%)",
+                        f"{r.cv_G:.2f}",
+                        f"({r.ci_cv_G[0]:.2f}–{r.ci_cv_G[1]:.2f})"),
+                        ("RCV (95%) (lognormal)",
+                        f"−{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%",
+                        None),
+                    ]
+
+                    if r.cv_I_cv_anova is not None and r.ci_cv_I_cv_anova is not None:
+                        metrics.append((
+                            "CV<sub>I</sub> <span style='font-size:0.75em;'>(based on CV-ANOVA)</span> (CI%)",
+                            f"{r.cv_I_cv_anova:.2f}",
+                            f"({r.ci_cv_I_cv_anova[0]:.2f}–{r.ci_cv_I_cv_anova[1]:.2f})"
+                        ))
+
+                    first_row  = metrics[:-3]
+                    second_row = metrics[-3:]
+
+                    def _render_row(row_metrics):
+                        cols = st.columns(len(row_metrics), gap="large")
+                        for col, (label, value, delta) in zip(cols, row_metrics):
+                            with col:
+                                st.markdown(f"""
+                                <div style="
+                                    background:#f0f0f3; border-radius:1rem; padding:0.8rem 1rem;
+                                    text-align:center;
+                                    box-shadow:6px 6px 12px rgba(0,0,0,0.12),
+                                            -6px -6px 12px rgba(255,255,255,0.85);
+                                ">
+                                <div style="font-size:1.4rem; font-weight:800; color:#1e3a5f;
+                                            line-height:1.1; margin-bottom:0.15rem;">
+                                    {label}
+                                </div>
+                                <div style="font-size:1rem; font-weight:600; color:#1b263b;
+                                            line-height:1.2;">{value}</div>
+                                {f"<div style='font-size:0.75rem; color:#5d6d7e; margin-top:0.3rem;'>{delta}</div>" if delta else ""}
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                    _render_row(first_row)
+                    if second_row:
+                        st.write(" "); st.write(" ")
+                        _render_row(second_row)
+
+                def _render_summary_section(r: BVResult, use_cv_anova_flag: bool | None = None):
+                    if use_cv_anova_flag is None:
+                        use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
+                    # Pick which CVI to display in summary
+                    if use_cv_anova_flag and (r.cv_I_cv_anova is not None) and (r.ci_cv_I_cv_anova is not None):
+                        cvi_val = float(r.cv_I_cv_anova)
+                        cvi_ci  = r.ci_cv_I_cv_anova
+                        cvi_lbl = "Within-subject (CVI, CV-ANOVA)"
+                    else:
+                        cvi_val = float(r.cv_I)
+                        cvi_ci  = r.ci_cv_I
+                        cvi_lbl = "Within-subject (CVI)"
+
+                    var_tbl = pd.DataFrame({
+                        "Variations": ["Analytical", cvi_lbl, "Between-subject"],
+                        "Variance":  [r.var_A,    r.var_WP,      r.var_BP],
+                        "CV %":      [r.cv_A,     cvi_val,       r.cv_G],
+                        "CI (95%)":  [f"{r.ci_cv_A[0]:.2f}–{r.ci_cv_A[1]:.2f}",
+                                    f"{cvi_ci[0]:.2f}–{cvi_ci[1]:.2f}",
+                                    f"{r.ci_cv_G[0]:.2f}–{r.ci_cv_G[1]:.2f}"],
+                    })
+
+                    st.dataframe(
+                        var_tbl.style
+                            .format({"Variance": "{:.3f}", "CV %": "{:.2f}"})
+                            .set_table_styles([{
+                                "selector": "th",
+                                "props": [("background-color", "#d0e7f5"),
+                                        ("color", "#1e3a5f"),
+                                        ("font-size", "0.9rem")]
+                            }]),
+                        hide_index=True,
+                        use_container_width=True
+                    )
+
+
+
+                def _render_aps_section(r: BVResult, use_cv_anova_flag: bool):
+                    if use_cv_anova_flag and (r.cv_I_cv_anova is not None) and (r.ci_cv_I_cv_anova is not None):
+                        cvi_for_aps = float(r.cv_I_cv_anova)
+                        cvi_source  = "CV-ANOVA"
+                        cvi_ci      = r.ci_cv_I_cv_anova
+                    else:
+                        cvi_for_aps = float(r.cv_I)
+                        cvi_source  = "standard ANOVA"
+                        cvi_ci      = r.ci_cv_I
+
+                    aps_df = build_aps_table(cvi_pct=cvi_for_aps, cvg_pct=r.cv_G)
+
+                    # --- APS TABLE (HTML header so CV subscript A renders) ---
+                    aps_df_disp = aps_df.rename(columns={"CVa": "CV<sub>A</sub>"})
+
+                    aps_html = (
+                        aps_df_disp.style
+                            .format({"CV<sub>A</sub>": "{:.1f}", "Bias": "{:.1f}", "MAU (k=2)": "{:.1f}"})
+                            .set_table_styles([
+                                {
+                                    "selector": "th",
+                                    "props": [
+                                        ("background-color", "#d0e7f5"),
+                                        ("color", "#1e3a5f"),
+                                        ("font-weight", "700"),
+                                    ],
+                                },
+                                {"selector": "td", "props": [("text-align", "right")]},
+                                {"selector": "td:first-child", "props": [("text-align", "left")]},
+                            ])
+                            .hide(axis="index")                      # ✅ hide index column
+                            .to_html(index=False, escape=False)      # ✅ do not render index
+                    )
+
+                    st.markdown(aps_html, unsafe_allow_html=True)
+
+
+                    st.caption(
+                        f"CVI used for APS: **{cvi_source}** → {cvi_for_aps:.2f}% "
+                        f"(95% CI {cvi_ci[0]:.2f}–{cvi_ci[1]:.2f}%); "
+                        f"MAU: Maximum Allowable Expanded Uncertainty."
+                    )
+
+                def _render_by_group(groups: dict[str, tuple[BVResult, pd.DataFrame]], render_one):
+                    """
+                    If only Overall exists → render once.
+                    If Male/Female exist → render in tabs.
+                    render_one(label, result, raw_df)
+                    """
+                    if len(groups) == 1:
+                        (label, (r, raw_df)), = groups.items()
+                        render_one(label, r, raw_df)
+                        return
+
+                    tabs = st.tabs(list(groups.keys()))
+                    for tab, (label, (r, raw_df)) in zip(tabs, groups.items()):
+                        with tab:
+                            render_one(label, r, raw_df)
+
+
+                # ─────────────────────────────────────────────────────────────
+                # Reusable render: Key metrics / Summary / APS / BIVAC
+                # ─────────────────────────────────────────────────────────────
+
 
 
                 # Key metrics — big bold labels, smaller numbers
                 #  Key metrics – two-row layout
                 # ────────────────────────────────────────────────────────────
-                st.subheader("Key metrics")
-                # NEW: pull the saved unit once (empty string if not set)
-                unit = st.session_state.get("result_unit", "").strip()
+                # st.subheader("Key metrics (cards)")
+                # _render_by_group(groups, lambda label, r, raw_df: _render_key_metrics_section(r, unit, use_cv_anova_flag))
 
-                # --- build the metrics list ---
-                metrics = [
-                    ("Mean (CI)",
-                    f"{res.grand_mean:.2f}" + (f" {unit}" if unit else ""),
-                    f"({res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f})" + (f" {unit}" if unit else "")),
-                    ("CV<sub>A</sub> (CI%)",
-                    f"{res.cv_A:.2f}",
-                    f"({res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f})"),
-                    ("CV<sub>I</sub> <span style='font-size:0.7em;'>(based on standard ANOVA)</span> (CI%)",
-                        f"{res.cv_I:.2f}",
-                        f"({res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f})"),
-                    ("CV<sub>G</sub> (CI%)",  f"{res.cv_G:.2f}",
-                        f"({res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f})"),
-                    ("RCV (95%) (lognormal)", f"−{res.rcv_95_down:.2f}% / +{res.rcv_95_up:.2f}%", None),
-                ]
+                st.write(" ")
+                st.subheader("Key metrics (table)")
+                _render_by_group(groups, lambda label, r, raw_df: _render_key_metrics_table(label, r, unit, use_cv_anova_flag))
 
-                # append the optional CV-ANOVA metric as *last* element
-                if res.cv_I_cv_anova is not None:
-                    metrics.append((
-                        "CV<sub>I</sub> <span style='font-size:0.75em;'>(based on CV-ANOVA)</span> (CI%)",
-                        f"{res.cv_I_cv_anova:.2f}",
-                        f"({res.ci_cv_I_cv_anova[0]:.2f}–{res.ci_cv_I_cv_anova[1]:.2f})"
-                    ))
-
-                # --- split into rows ------------------------------------------------------
-                first_row  = metrics[:-3]                     # everything except the very last
-                second_row = metrics[-3:]                    # the last metric (may be empty)
-
-                # helper that renders one row of “cards”
-                def _render_row(row_metrics):
-                    cols = st.columns(len(row_metrics), gap="large")
-                    for col, (label, value, delta) in zip(cols, row_metrics):
-                        with col:
-                            st.markdown(f"""
-                            <div style="
-                                background:#f0f0f3; border-radius:1rem; padding:0.8rem 1rem;
-                                text-align:center;
-                                box-shadow:6px 6px 12px rgba(0,0,0,0.12),
-                                        -6px -6px 12px rgba(255,255,255,0.85);
-                            ">
-                            <div style="font-size:1.4rem; font-weight:800; color:#1e3a5f;
-                                        line-height:1.1; margin-bottom:0.15rem;">
-                                {label}
-                            </div>
-                            <div style="font-size:1rem; font-weight:600; color:#1b263b;
-                                        line-height:1.2;">{value}</div>
-                            {f"<div style='font-size:0.75rem; color:#5d6d7e; margin-top:0.3rem;'>{delta}</div>" if delta else ""}
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                # draw the two rows
-                _render_row(first_row)
-                if second_row:                               
-                    st.write(" ")
-                    st.write(" ")
-                    _render_row(second_row)
 
 
                 # Summary table of CVs and 95% CIs
-                st.write(" ")
-                st.write(" ")
-                st.subheader("Summary of variation metrics")
-                var_tbl = pd.DataFrame({
-                    "Variations": ["Analytical", "Within‑subject", "Between‑subject"],
-                    "Variance":  [res.var_A,    res.var_WP,      res.var_BP],
-                    "CV %":      [res.cv_A,     res.cv_I,        res.cv_G],
-                    "CI (95%)":   [f"{res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}",
-                                f"{res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}",
-                                f"{res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}"],
-                })
+                # st.write(" ")
+                # st.write(" ")
+                # st.subheader("Summary of variation metrics")
 
-                st.dataframe(
-                    var_tbl.style
-                        .format({"Variance": "{:.3f}", "CV %": "{:.2f}"})
-                        .set_table_styles([{
-                            "selector": "th",
-                            "props": [("background-color", "#d0e7f5"),
-                                        ("color", "#1e3a5f"),
-                                        ("font-size", "0.9rem")]
-                        }]),
-                    hide_index=True,
-                    use_container_width=True
-                )
+                # _render_by_group(groups, lambda label, r, raw_df: _render_summary_section(r, use_cv_anova_flag))
 
 
                 # -------------------- APS TABLE --------------------
+                st.divider()
                 st.write(" ")
                 st.subheader("Analytical Performance Specifications (APS)")
 
-                # Pick CVI to feed into APS: CV-ANOVA if selected & available, else standard ANOVA
-                use_cv_anova_flag = st.session_state.get("use_cv_anova", False)
-                if use_cv_anova_flag and (res.cv_I_cv_anova is not None):
-                    cvi_for_aps = float(res.cv_I_cv_anova)
-                    cvi_source  = "CV-ANOVA"
-                    cvi_ci      = res.ci_cv_I_cv_anova
-                else:
-                    cvi_for_aps = float(res.cv_I)
-                    cvi_source  = "standard ANOVA"
-                    cvi_ci      = res.ci_cv_I
+                _render_by_group(groups, lambda label, r, raw_df: _render_aps_section(r, use_cv_anova_flag))
 
-                aps_df = build_aps_table(
-                    cvi_pct=cvi_for_aps,   # ← now driven by selection above
-                    cvg_pct=res.cv_G,      # k fixed to 2.0 inside the helper
-                )
-
-                st.dataframe(
-                    aps_df.style
-                        .format({"CVa": "{:.1f}", "Bias": "{:.1f}", "MAU (k=2)": "{:.1f}"})
-                        .set_table_styles([{
-                            "selector": "th",
-                            "props": [("background-color", "#d0e7f5"), ("color", "#1e3a5f")]
-                        }]),
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                st.caption(
-                    "Formulas: CVa = f×CVI; Bias = g×√(CVI²+CVG²); MAU = k×f×CVI with fixed k=2 (reflects 95% confidence interval (CI)). "
-                    "Levels → Optimal: f=0.25, g=0.125; Desirable: f=0.50, g=0.25; Minimum: f=0.75, g=0.375. "
-                    "Abbreviations: CVa analytical CV; CVI within-subject BV; CVG between-subject BV; "
-                    "MAU expanded allowable measurement uncertainty."
-                )
-
-                # Make it crystal-clear which CVI fed the APS numbers
-                st.caption(
-                    f"CVI used for APS: **{cvi_source}** → {cvi_for_aps:.2f}% "
-                    f"(95% CI {cvi_ci[0]:.2f}–{cvi_ci[1]:.2f}%)."
-                )
                 # ---------------------------------------------------
 
 
 
                 # — Per-subject mean ± range plot ————————————————————————————————
                 # Build only the final dataset unconditionally (balanced/unbalanced per sidebar)
-                final_df, _ = _preprocess_bv_dataframe(
-                    df_for_calc,
-                    flags=st.session_state["preproc_flags"],
-                    enforce_balance=st.session_state["enforce_balance"]
-                )
-
-                st.subheader("Per-subject distribution")
+                final_df = res.clean_df
+                if final_df is None or final_df.empty:
+                    st.error("Cleaned dataset is empty after QC.")
+                    st.stop()
+                n_raw  = len(df_for_calc)
+                n_kept = len(final_df)
+                
+                st.subheader("Per-subject distribution (overall)")
                 st.plotly_chart(plot_subject_ranges(final_df), use_container_width=True)
 
                 # ⬇️ NEW: run/show population trend ONLY if the sidebar switch is ON
@@ -2258,247 +3388,87 @@ if user_df is not None:
                 import re
                 from collections import defaultdict
 
-                def _build_qi_checklist(
-                        log_lines: list[str],
-                        res: BVResult,
-                        flags: dict[str, bool],
-                        *,
-                        qi_manual: dict[str, str] | None = None,
-                        n_raw: int | None = None,
-                        n_kept: int | None = None
-                ) -> pd.DataFrame:
-                    """BIVAC v1.1 checklist (QI 1–14) with Grade, Comment, and Details."""
-
-                    def worst(g1, g2):
-                        order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
-                        return g1 if order[g1] >= order[g2] else g2
-
-                    # ---------- helpers to mine Details from the preprocessing log ----------
-                    def pick(*keywords):
-                        hits = [l for l in log_lines if all(k.lower() in l.lower() for k in keywords)]
-                        return hits
-
-                    def any_kw(*keywords):
-                        return any(k.lower() in l.lower() for l in log_lines for k in keywords)
-
-                    details = {str(i): [] for i in range(1, 15)}
-                    grade, comment = {}, {}
-
-                    # ---------------- QI 1–5 (manual) ----------------
-                    if qi_manual:
-                        g1 = qi_manual.get("QI 1 – Scale", "A")
-                        g2 = qi_manual.get("QI 2 – Subjects", "A")
-                        g3 = qi_manual.get("QI 3 – Samples", "A")
-                        g4 = qi_manual.get("QI 4 – Measurand/Method", "A")
-                        g5 = qi_manual.get("QI 5 – Preanalytical", "A")
-                        grade.update({"1": g1, "2": g2, "3": g3, "4": g4, "5": g5})
-                        comment.update({
-                            "1": f"User-selected {g1}.",
-                            "2": f"User-selected {g2}.",
-                            "3": f"User-selected {g3}.",
-                            "4": f"User-selected {g4}.",
-                            "5": f"User-selected {g5}."
-                        })
-                        # Details just restate the chosen level (no logs exist for QI1–5)
-                        details["1"].append(f"Manual: Scale → {g1}.")
-                        details["2"].append(f"Manual: Subjects → {g2}.")
-                        details["3"].append(f"Manual: Samples → {g3}.")
-                        details["4"].append(f"Manual: Measurand/Method → {g4}.")
-                        details["5"].append(f"Manual: Preanalytical → {g5}.")
-
-                    # ---------------- QI 6 (analytical imprecision) ----------------
-                    # A requires same-run replicates; if you added the checkbox, we read it here.
-                    same_run = (qi_manual or {}).get("QI 6 – same run", True)
-                    if res.R >= 2 and same_run:
-                        grade["6"] = "A"
-                    elif res.R >= 2:
-                        grade["6"] = "B"
-                    else:
-                        grade["6"] = "C"
-                    comment["6"] = f"{res.R} replicate(s)/sample; {'same run' if same_run else 'different run/unknown'}."
-                    details["6"].extend(pick("QI 6", "imprecision"))
-                    details["6"].extend(pick("replicate", "Cochran"))  # replicate-level outlier cleaning helps explain CVA
-                    details["6"].append(f"CVₐ {res.cv_A:.2f}% (95% CI {res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}%).")
-
-                    # ---------------- QI 7 (steady state / drift) ----------------
-                    drift_checked = flags.get("drift", True)
-                    drift_found = any_kw("temporal drift")
-                    if drift_checked:
-                        grade["7"] = "A"
-                        comment["7"] = "Trend analysis performed; drifting subjects removed." if drift_found else "No drift detected."
-                    else:
-                        grade["7"] = "B"
-                        comment["7"] = "Trend analysis not performed."
-                    details["7"].extend(pick("QI 7", "temporal drift"))
-                    details["7"].extend(pick("Total subjects excluded for drift"))
-                    # if nothing matched, still store something minimal
-                    if not details["7"]:
-                        details["7"].append("No drift messages in log.")
-
-                    # ---------------- QI 8 (outliers) ----------------
-                    rep_ok  = flags.get("rep_cochran", True)
-                    samp_ok = flags.get("samp_cochran", True)
-                    subj_ok = flags.get("reed", True)
-                    if samp_ok and rep_ok and subj_ok:
-                        grade["8"] = "A"; comment["8"] = "Replicate / sample / subject outlier tests performed."
-                    elif samp_ok:
-                        grade["8"] = "B"; comment["8"] = "Sample-level outlier test performed; replicate/subject not fully performed."
-                    else:
-                        grade["8"] = "C"; comment["8"] = "Sample-level outlier analysis not performed."
-                    details["8"].extend(pick("Cochran (replicate"))
-                    details["8"].extend(pick("replicate Cochran outlier removed"))
-                    details["8"].extend(pick("Cochran (Subject"))
-                    details["8"].extend(pick("sample Cochran outlier removed"))
-                    details["8"].extend(pick("Reed mean outlier"))
-                    if not details["8"]:
-                        details["8"].append("No outlier removals recorded.")
-
-                    # ---------------- QI 9 (normality) ----------------
-                    norm_checked = flags.get("normality", True)
-                    if norm_checked:
-                        grade["9"] = "A"
-                        comment["9"] = "Distribution assessed; transform if needed."
-                    else:
-                        grade["9"] = "B"
-                        comment["9"] = "Distribution not assessed."
-                    details["9"].extend(pick("Normality check"))
-                    details["9"].extend(pick("Subject-means Shapiro-Wilk"))
-                    details["9"].extend([l for l in log_lines if "log transform" in l.lower()])
-                    if not details["9"]:
-                        details["9"].append("No normality/transform messages in log.")
-
-                    # ---------------- QI 10 (variance homogeneity) ----------------
-                    wp_examined = flags.get("wp_bartlett", True)
-                    het = any(("heterogeneous" in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
-                    if wp_examined and not het:
-                        grade["10"] = "A"; comment["10"] = "Variance homogeneity examined; acceptable."
-                    else:
-                        grade["10"] = "C"; comment["10"] = "Variance homogeneity not examined or heterogeneous."
-                    details["10"].extend(pick("QI 10", "Bartlett"))
-                    details["10"].extend(pick("Within-subject Bartlett"))
-                    details["10"].extend(pick("High within-subject variance"))
-                    details["10"].extend(pick("Replicate Bartlett"))
-                    if not details["10"]:
-                        details["10"].append("No variance-homogeneity messages in log.")
-
-                    # ---------------- QI 11 (statistical method) ----------------
-                    grade["11"] = "A"
-                    if (res.S == int(res.S)) and (res.R == int(res.R)):
-                        comment["11"] = "Nested ANOVA (balanced, closed-form)."
-                        details["11"].append("Balanced crossed design; closed-form variance decomposition.")
-                    else:
-                        comment["11"] = "Variance decomposition on unbalanced data."
-                        details["11"].append("Unbalanced design; method-of-moments variance decomposition.")
-
-                    # ---------------- QI 12 (confidence limits) ----------------
-                    grade["12"] = "A"
-                    comment["12"] = "95% CIs for CVA/CVI/CVG provided."
-                    details["12"].append(
-                        f"CIs present: CVA {res.ci_cv_A[0]:.2f}–{res.ci_cv_A[1]:.2f}%, "
-                        f"CVI {res.ci_cv_I[0]:.2f}–{res.ci_cv_I[1]:.2f}%, "
-                        f"CVG {res.ci_cv_G[0]:.2f}–{res.ci_cv_G[1]:.2f}%."
-                    )
-
-                    # ---------------- QI 13 (number of included results) ----------------
-                    if (n_raw is not None) and (n_kept is not None):
-                        n_excl = max(n_raw - n_kept, 0)
-                        grade["13"] = "A"
-                        comment["13"] = f"{n_kept} used / {n_raw} raw (excluded {n_excl})."
-                        details["13"].extend(pick("results retained", "Balanced data set"))
-                        details["13"].append(f"Kept {n_kept} of {n_raw} measurements.")
-                    elif (n_kept is not None):
-                        grade["13"] = "B"
-                        comment["13"] = f"{n_kept} results used (exclusions not documented)."
-                    else:
-                        grade["13"] = "C"
-                        comment["13"] = "Counts not documented."
-
-                    # ---------------- QI 14 (mean concentration) ----------------
-
-                    unit = st.session_state.get("result_unit", "").strip()  # NEW
-                    grade["14"] = "A"
-                    comment["14"] = (
-                        f"Mean concentration reported ({res.grand_mean:.2f}"
-                        + (f" {unit}" if unit else "")
-                        + ")."
-                    )
-                    details["14"].append(
-                        f"Mean {res.grand_mean:.2f}"
-                        + (f" {unit}" if unit else "")
-                        + f" (95% CI {res.ci_mean[0]:.2f}–{res.ci_mean[1]:.2f}"
-                        + (f" {unit}" if unit else "")
-                        + ")."
-                    )
-
-                    # assemble rows (add Details column)
-                    rows, overall = [], "A"
-                    for q in map(str, range(1, 15)):
-                        overall = worst(overall, grade[q])
-                        rows.append(dict(
-                            QI=f"QI {q}",
-                            Grade=grade[q],
-                            Comment=comment[q],
-                            Details=" ⏵ ".join(details[q]) if details[q] else ""
-                        ))
-                    df = pd.DataFrame(rows)
-                    df.attrs["overall_grade"] = overall
-                    return df
-
-
-
                 # ── render the checklist & XLSX download ────────────────────────────────────
                 st.subheader("BIVAC Checklist (QI 1 → QI 14)")
-                # After clean_df is created (you already have this a few lines above)
-                n_raw  = len(df_for_calc)
-                n_kept = len(final_df)
 
-                bivac_df = _build_qi_checklist(
-                    res.preprocess_log,
-                    res,
-                    flags=st.session_state["preproc_flags"],
-                    qi_manual=st.session_state.get("qi_manual"),
-                    n_raw=n_raw,
-                    n_kept=n_kept
-                )
+                def _render_one_bivac(label: str, r: BVResult, raw_df: pd.DataFrame):
+                    final_df_x = r.clean_df
+                    if final_df_x is None or final_df_x.empty:
+                        st.error(f"{label}: cleaned dataset is empty after QC.")
+                        return
 
-                st.dataframe(
-                    bivac_df.style
-                        .apply(
-                            lambda s: ["background:#e8f9f0" if g in ("A", "B") else "background:#fdecea" for g in s],
-                            axis=1, subset=["Grade"]
-                        )
-                        .apply(_style_details_series, subset=["Details"])   # ← NEW
-                        .set_properties(**{"font-size": "0.85rem"}),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                    n_raw_x = len(raw_df)
+                    n_kept_x = len(final_df_x)
 
-                overall = bivac_df.attrs["overall_grade"]
-                st.markdown(f"**Overall BIVAC grade: {overall}**")
+                    unit = st.session_state.get("result_unit", "").strip()
 
-                # ⬇️  Excel export (tries xlsxwriter → falls back to openpyxl)
-                with st.expander("⇢ Download checklist"):
-                    import io, importlib
-                    engine = "xlsxwriter" if importlib.util.find_spec("xlsxwriter") else "openpyxl"
-
-                    xio = io.BytesIO()
-                    with pd.ExcelWriter(xio, engine=engine) as xl:
-                        bivac_df.to_excel(xl, index=False, sheet_name="BIVAC_QI_1-14")
-                    st.download_button(
-                        "Excel file",
-                        data=xio.getvalue(),
-                        file_name="BIVAC_QI_1-14.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    bivac_df = _build_qi_checklist(
+                        r.preprocess_log,
+                        r,
+                        flags=flags,
+                        qi_manual=qi_manual,
+                        n_raw=n_raw_x,
+                        n_kept=n_kept_x,
+                        unit=unit,   # ✅ keeps units showing
                     )
+
+                    st.dataframe(
+                        bivac_df.style
+                            .apply(
+                                lambda s: ["background:#e8f9f0" if g in ("A", "B") else "background:#fdecea" for g in s],
+                                axis=1, subset=["Grade"]
+                            )
+                            .apply(_style_details_series, subset=["Details"])
+                            .set_properties(**{"font-size": "0.85rem"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.markdown(f"**Overall BIVAC grade: {bivac_df.attrs['overall_grade']}**")
+
+
+
+                _render_by_group(groups, lambda label, r, raw_df: _render_one_bivac(label, r, raw_df))
 
 
                 # — Outlier / normality audit trail —
                 with st.expander("Pre-processing log"):
-                    if res.preprocess_log:
-                        # use same alpha you used in analysis (default 0.05)
-                        st.markdown(_render_log_html(res.preprocess_log, alpha=0.05), unsafe_allow_html=True)
+                    if st.session_state.get("gender_based", False) and (res_male is not None) and (res_female is not None):
+                        t0, t1, t2 = st.tabs(["Overall", "Male", "Female"])
+                        with t0:
+                            st.markdown(_render_log_html(res.preprocess_log, alpha=0.05), unsafe_allow_html=True)
+                        with t1:
+                            st.markdown(_render_log_html(res_male.preprocess_log, alpha=0.05), unsafe_allow_html=True)
+                        with t2:
+                            st.markdown(_render_log_html(res_female.preprocess_log, alpha=0.05), unsafe_allow_html=True)
                     else:
-                        st.write("No outliers detected; data met normality assumptions.")
+                        st.markdown(_render_log_html(res.preprocess_log, alpha=0.05), unsafe_allow_html=True)
+
+                # ✅ Download ALL checklists in one workbook (multi-sheet)
+                with st.expander("⇢ Download BIVAC checklist", expanded=False):
+                    import importlib
+                    engine = "xlsxwriter" if importlib.util.find_spec("xlsxwriter") else "openpyxl"
+
+                    all_xio = io.BytesIO()
+                    with pd.ExcelWriter(all_xio, engine=engine) as xl:
+                        for label, (r, raw_df) in groups.items():
+                            try:
+                                biv = build_bivac_df_for_group(label, r, raw_df)
+                                # Excel sheet names max 31 chars
+                                sheet = f"BIVAC_{label}"[:31]
+                                biv.to_excel(xl, index=False, sheet_name=sheet)
+                            except Exception as e:
+                                # still write a small sheet explaining why it's missing
+                                sheet = f"BIVAC_{label}"[:31]
+                                pd.DataFrame({"Error": [str(e)]}).to_excel(xl, index=False, sheet_name=sheet)
+
+                    st.download_button(
+                        label="⬇️ Download BIVAC checklist (XLSX)",
+                        data=all_xio.getvalue(),
+                        file_name="BIVAC_QI_1-14_AllGroups.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_bivac_allgroups",
+                    )
 
 
             except PreprocessError as e:
