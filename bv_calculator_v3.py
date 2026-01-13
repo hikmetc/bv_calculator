@@ -15,8 +15,8 @@ v5 highlights
 -------------
 * **Deep inline commentary** – every major line now has a `#` explanation so readers can
   follow both the Streamlit UI and the statistical maths.
-* Template download in **CSV & XLSX** formats.
-* Three data‑entry modes: *upload*, *paste*, *manual table*.
+* Template download in **XLSX** formats.
+
 
 Run locally
 -----------
@@ -1967,6 +1967,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
 # ─────────────────────────────────────────────────────────────────────────────
 # Beautiful per-subject mean ± range (min–max) plot
 # ─────────────────────────────────────────────────────────────────────────────
+
 def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
     """
     Build a compact, minimalistic plot:
@@ -1980,7 +1981,9 @@ def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
     """
     # read unit from session_state if present
     unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
-    y_title = "Result" + (f" ({unit})" if unit else "")
+    measurand = st.session_state.get("measurand_name", "").strip() if "measurand_name" in st.session_state else "Result"
+    if not measurand: measurand = "Result"
+    y_title = f"{measurand}" + (f" ({unit})" if unit else "")
 
     # ── summarise data ──────────────────────────────────────────────────────
     agg = (clean_df.groupby("Subject")["Result"]
@@ -2050,6 +2053,182 @@ def plot_subject_ranges(clean_df: pd.DataFrame) -> go.Figure:
     )
 
     return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gender-stratified subject range plot
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_gender_stratified_ranges(clean_df: pd.DataFrame, gender_map: dict[str, str]) -> go.Figure:
+    """
+    Plot per-subject ranges (min-max) and means, stratified by Gender (Female/Male).
+    Includes:
+      - Group Mean (solid line)
+      - 95% CI of the Mean (shaded band)
+      - 5th and 95th Percentiles (dashed lines)
+    """
+    # 1. Merge gender info
+    df = clean_df.copy()
+    df["Gender"] = df["Subject"].map(gender_map)
+    
+    # Filter to known genders and required columns
+    df = df[df["Gender"].isin(["Male", "Female"])].copy()
+    if df.empty:
+        return go.Figure().update_layout(title="No gender-mapped data available for plot")
+
+    # 2. Aggregations per subject
+    subj_agg = (df.groupby(["Gender", "Subject"])["Result"]
+                  .agg(mean="mean", min="min", max="max")
+                  .reset_index())
+    
+    # Sort: Female first, then Male. Within gender: sort by Subject ID (or mean?)
+    subj_agg = subj_agg.sort_values(by=["Gender", "Subject"], ascending=[True, True])
+    
+    # 3. Calculate Group Statistics
+    stats = {}
+    for g in ["Female", "Male"]:
+        g_data = subj_agg[subj_agg["Gender"] == g]
+        if g_data.empty:
+            continue
+            
+        group_mean = g_data["mean"].mean()
+        # 95% CI of the Mean: Mean +/- t * SE
+        n = len(g_data)
+        se = g_data["mean"].std(ddof=1) / np.sqrt(n) if n > 1 else 0
+        t_crit = t.ppf(0.975, n-1) if n > 1 else 0
+        ci_lower = group_mean - t_crit * se
+        ci_upper = group_mean + t_crit * se
+        
+        # Percentiles (5th and 95th) of the population (subject means)
+        p05 = g_data["mean"].quantile(0.05)
+        p95 = g_data["mean"].quantile(0.95)
+        
+        stats[g] = {
+            "mean": group_mean,
+            "ci_low": ci_lower,
+            "ci_high": ci_upper,
+            "p05": p05,
+            "p95": p95,
+            "count": n
+        }
+
+    # 4. Plotting
+    fig = go.Figure()
+    
+    subj_agg["x_label"] = subj_agg["Subject"].astype(str).apply(lambda x: f"Subject {x}")
+    
+    current_x = 0
+    boundary_x = None
+    
+    configs = {
+        "Female": {"color": "#d62728", "name": "Female"}, # Red
+        "Male":   {"color": "#1f77b4", "name": "Male"}    # Blue
+    }
+    
+    for gender in ["Female", "Male"]:
+        g_df = subj_agg[subj_agg["Gender"] == gender]
+        if g_df.empty:
+            continue
+            
+        # Add traces for subjects
+        fig.add_trace(go.Scatter(
+            x=g_df["x_label"], 
+            y=g_df["mean"],
+            mode='markers',
+            name=f"{gender} Subjects",
+            marker=dict(color=configs[gender]["color"], size=6),
+            error_y=dict(
+                type='data',
+                symmetric=False,
+                array=g_df["max"] - g_df["mean"],
+                arrayminus=g_df["mean"] - g_df["min"],
+                color=configs[gender]["color"],
+                thickness=1,
+                width=0
+            ),
+            showlegend=False,
+            hovertemplate="Subject: %{x}<br>Mean: %{y:.2f}<extra></extra>"
+        ))
+        
+        # Add Reference Lines
+        s = stats.get(gender)
+        if s:
+            x0 = current_x - 0.4
+            x1 = current_x + s["count"] - 0.6
+            
+            # Mean (Solid)
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=s["mean"], y1=s["mean"],
+                          line=dict(color=configs[gender]["color"], width=2, dash="solid"))
+            
+            # CI Band (Shaded Rectangle)
+            fig.add_shape(type="rect", x0=x0, x1=x1, y0=s["ci_low"], y1=s["ci_high"],
+                          fillcolor=configs[gender]["color"], opacity=0.15, line_width=0)
+            
+            # Percentiles (Dashed)
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=s["p05"], y1=s["p05"],
+                          line=dict(color=configs[gender]["color"], width=1, dash="dash"))
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=s["p95"], y1=s["p95"],
+                          line=dict(color=configs[gender]["color"], width=1, dash="dash"))
+        
+        current_x += len(g_df)
+        
+        if gender == "Female" and "Male" in stats:
+            boundary_x = current_x - 0.5
+
+    # Vertical Divider Line
+    if boundary_x is not None:
+        fig.add_vline(x=boundary_x, line_width=1, line_dash="dash", line_color="black")
+
+    # Layout
+    unit = st.session_state.get("result_unit", "").strip() if "result_unit" in st.session_state else ""
+    measurand = st.session_state.get("measurand_name", "").strip() if "measurand_name" in st.session_state else "Result"
+    if not measurand: measurand = "Result"
+    y_title = f"{measurand}" + (f" ({unit})" if unit else "")
+
+    fig.update_layout(
+        title="Gender-stratified Per-subject Distribution",
+        template="simple_white",
+        yaxis_title=y_title,
+        xaxis_title="",
+        xaxis=dict(
+            tickangle=-45,
+            showgrid=True,
+            gridcolor="#f0f0f0"
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#f0f0f0"
+        ),
+        showlegend=True,
+        height=500
+    )
+    
+    # Manual Legend items
+    for g in ["Female", "Male"]:
+        if g in stats:
+            # Group Mean
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color=configs[g]["color"], dash="solid", width=2),
+                name=f"{g} Mean"
+            ))
+            # 95% CI of Mean (Shaded Region)
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='markers',
+                marker=dict(symbol="square", color=configs[g]["color"], opacity=0.3, size=10),
+                name=f"{g} Mean 95% CI"
+            ))
+            # 5th and 95th Percentiles
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color=configs[g]["color"], dash="dash", width=1),
+                name=f"{g} 5th-95th Percentile"
+            ))
+            
+    return fig
+
+
+
+
 
 # ——————————————————————————————————————————————————————————————
 # 5.  Prepare template datasets for users to download (CSV & XLSX)
@@ -2467,6 +2646,12 @@ if user_df is not None:
                 res_sel  = st.selectbox("Result / value",     cols,
                                         index=_default_idx("Result", cols),
                                         help="Numeric measurement; one unit.")
+                measurand_name = st.text_input(
+                                            "Measurand (e.g. Glucose)",
+                                            value=st.session_state.get("measurand_name", ""),
+                                            placeholder="e.g. Glucose",
+                                            help="Enter the name of the measurand for plot labels."
+                                        )
             # Single save button (no reset button)
             confirmed = st.form_submit_button("Save mapping", use_container_width=True)
             st.caption("To change mapping later, adjust the selections above and click **Save mapping** again.")
@@ -2488,6 +2673,7 @@ if user_df is not None:
                 st.session_state["mapping_ok"] = True
                 st.session_state["mapped_df"] = mapped_df
                 st.session_state["result_unit"] = (result_unit or "").strip()   # NEW
+                st.session_state["measurand_name"] = (measurand_name or "").strip()   # NEW
                 st.session_state["mapped_source_cols"] = list(user_df.columns)  # NEW
                 st.success("Mapping saved ✓ — columns validated and ready to calculate.")
                 st.caption(f"Preview of mapped columns (first 8 rows):")
@@ -3352,6 +3538,14 @@ if user_df is not None:
                 st.subheader("Per-subject distribution (overall)")
                 st.plotly_chart(plot_subject_ranges(final_df), use_container_width=True)
 
+                if st.session_state.get("gender_based", False) and "df_gender" in locals() and "Gender" in df_gender.columns:
+                     st.subheader("Gender-stratified distribution")
+                     # Re-map gender to the final cleaned dataframe using the calculation-time gender df
+                     gender_map = df_gender.set_index("Subject")["Gender"].to_dict()
+                     st.plotly_chart(plot_gender_stratified_ranges(final_df, gender_map), use_container_width=True)
+                elif st.session_state.get("gender_based", False):
+                     st.warning("Gender plot could not be generated: 'Gender' column missing in processed data.")
+
                 # ⬇️ NEW: run/show population trend ONLY if the sidebar switch is ON
                 if st.session_state["preproc_flags"].get("pop_drift", False):
                     # Build the pre-balance dataset only now (so we don't pay the cost unless needed)
@@ -3485,3 +3679,4 @@ if user_df is not None:
             st.error(f"Calculation failed: {e}")
 else:
     st.info("Input data above to enable calculation.")
+
