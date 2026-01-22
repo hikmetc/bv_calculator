@@ -15,8 +15,8 @@ v5 highlights
 -------------
 * **Deep inline commentary** – every major line now has a `#` explanation so readers can
   follow both the Streamlit UI and the statistical maths.
-* Template download in **XLSX** formats.
-
+* Template download in **CSV & XLSX** formats.
+* Three data‑entry modes: *upload*, *paste*, *manual table*.
 
 Run locally
 -----------
@@ -262,6 +262,13 @@ QI15_CHOICES = {
             "A": "Yes (adequate)",
             "B": "Insufficient detail (unlikely important)",
             "C": "Insufficient detail (may be important) or No details provided",
+        },
+    },
+    "QI 6 – Analytical Variation": {
+        "help": "Estimates of analytical variation: same-run vs. different-run replicates.",
+        "options": {
+            "A": "All replicates for the same subject analyzed in the same run",
+            "B": "Replicate analyses of samples performed in different runs",
         },
     },
 }
@@ -566,123 +573,208 @@ def _build_qi_checklist(
         details["4"].append(f"Manual: Measurand/Method → {g4}.")
         details["5"].append(f"Manual: Preanalytical → {g5}.")
 
-    # ---------------- QI 6 (analytical imprecision) ----------------
-    same_run = (qi_manual or {}).get("QI 6 – same run", True)
-    if res_.R >= 2 and same_run:
-        grade["6"] = "A"
-    elif res_.R >= 2:
-        grade["6"] = "B"
+    # ---------------- QI 6 (Estimates of analytical variation) ----------------
+    # BIVAC Table 1:
+    # A: Estimates presented, all replicates for same subject analyzed in same run
+    # B: Estimates presented but obtained by other method OR replicates in different runs
+    # C: No estimates presented
+    qi6_grade = (qi_manual or {}).get("QI 6 – Analytical Variation", "A")
+    if res_.R >= 2:
+        grade["6"] = qi6_grade  # User selection (A=same run, B=different runs)
+        if qi6_grade == "A":
+            comment["6"] = f"Estimates presented ({res_.R} replicates/sample); same run analysis."
+        else:
+            comment["6"] = f"Estimates presented ({res_.R} replicates/sample); different runs."
     else:
         grade["6"] = "C"
-    comment["6"] = f"{res_.R} replicate(s)/sample; {'same run' if same_run else 'different run/unknown'}."
-    details["6"].extend(pick("QI 6", "imprecision"))
-    details["6"].extend(pick("replicate", "Cochran"))
+        comment["6"] = f"No replicate analysis (only {res_.R} replicate/sample)."
+    details["6"].append(f"User selected: Grade {qi6_grade}.")
     details["6"].append(f"CVₐ {res_.cv_A:.2f}% (95% CI {res_.ci_cv_A[0]:.2f}–{res_.ci_cv_A[1]:.2f}%).")
 
-    # ---------------- QI 7 (steady state / drift) ----------------
+    # ---------------- QI 7 (Steady state) ----------------
+    # BIVAC Table 1:
+    # A: Yes - individual trend analysis performed or data adequately transformed
+    # B: Not performed, but unlikely important for measurand
+    # C: Not performed, and may be important (e.g., hormones) or clinical setting
     drift_checked = flags.get("drift", True)
-    drift_found = any_kw("temporal drift")
+    drift_removed = any_kw("temporal drift", "removed") or any_kw("drift outlier removed")
+    drift_passed = any_kw("Steady-state drift test passed")
+    
     if drift_checked:
         grade["7"] = "A"
-        comment["7"] = "Trend analysis performed; drifting subjects removed." if drift_found else "No drift detected."
+        if drift_removed:
+            comment["7"] = "Individual trend analysis performed; drifting subjects removed."
+        elif drift_passed:
+            comment["7"] = "Individual trend analysis performed; all subjects in steady state."
+        else:
+            comment["7"] = "Individual trend analysis performed."
     else:
-        grade["7"] = "B"
-        comment["7"] = "Trend analysis not performed."
-    details["7"].extend(pick("QI 7", "temporal drift"))
-    details["7"].extend(pick("Total subjects excluded for drift"))
+        # Use user selection from sidebar (qi7_importance)
+        qi7_grade = flags.get("qi7_importance", "C")  # Default to C if not set
+        if qi7_grade not in ["A", "B", "C"]:
+            qi7_grade = "C"
+        grade["7"] = qi7_grade
+        if qi7_grade == "B":
+            comment["7"] = "Individual trend analysis not performed; unlikely important for this measurand."
+        else:
+            comment["7"] = "Individual trend analysis not performed; may be important for this measurand."
+    details["7"].extend(pick("QI 7", "drift"))
+    details["7"].extend(pick("temporal drift"))
     if not details["7"]:
         details["7"].append("No drift messages in log.")
 
-    # ---------------- QI 8 (outliers) ----------------
-    rep_ok  = flags.get("rep_cochran", True)
+    # ---------------- QI 8 (Outliers) ----------------
+    # BIVAC Table 1:
+    # A: Testing for outliers of (a) Replicates, (b) Samples per subject, (c) Subjects - ALL performed
+    # B: (b) Fulfilled, but (a) replicate analysis not performed, and/or (c) subject outlier analysis not performed
+    # C: (b) Sample-level outlier analysis not performed, or only performed on total data set
+    rep_ok = flags.get("rep_cochran", True)
     samp_ok = flags.get("samp_cochran", True)
     subj_ok = flags.get("reed", True)
-    if samp_ok and rep_ok and subj_ok:
-        grade["8"] = "A"; comment["8"] = "Replicate / sample / subject outlier tests performed."
+    
+    if rep_ok and samp_ok and subj_ok:
+        grade["8"] = "A"
+        comment["8"] = "Outlier testing performed: (a) Replicates, (b) Samples, (c) Subjects."
     elif samp_ok:
-        grade["8"] = "B"; comment["8"] = "Sample-level outlier test performed; replicate/subject not fully performed."
+        grade["8"] = "B"
+        missing = []
+        if not rep_ok:
+            missing.append("replicate")
+        if not subj_ok:
+            missing.append("subject")
+        comment["8"] = f"Sample-level outlier testing performed; {'/'.join(missing)} outlier testing not performed."
     else:
-        grade["8"] = "C"; comment["8"] = "Sample-level outlier analysis not performed."
-    details["8"].extend(pick("Cochran (replicate"))
-    details["8"].extend(pick("replicate Cochran outlier removed"))
-    details["8"].extend(pick("Cochran (Subject"))
-    details["8"].extend(pick("sample Cochran outlier removed"))
-    details["8"].extend(pick("Reed mean outlier"))
+        grade["8"] = "C"
+        comment["8"] = "Sample-level outlier analysis not performed."
+    
+    details["8"].extend(pick("Cochran", "replicate"))
+    details["8"].extend(pick("Cochran", "sample"))
+    details["8"].extend(pick("Reed"))
     if not details["8"]:
-        details["8"].append("No outlier removals recorded.")
+        details["8"].append("No outlier messages in log.")
 
-    # ---------------- QI 9 (normality) ----------------
+    # ---------------- QI 9 (Normally distributed data) ----------------
+    # BIVAC Table 1:
+    # A: Yes - distribution assessed for each subject, transformed if not normal
+    # B: No - distribution not assessed
     norm_checked = flags.get("normality", True)
+    log_transformed = any_kw("log transform")
+    
     if norm_checked:
-        grade["9"] = "A"; comment["9"] = "Distribution assessed; transform if needed."
+        grade["9"] = "A"
+        if log_transformed:
+            comment["9"] = "Distribution assessed; log-transformation applied."
+        else:
+            comment["9"] = "Distribution assessed for normality."
     else:
-        grade["9"] = "B"; comment["9"] = "Distribution not assessed."
-    details["9"].extend(pick("Normality check"))
-    details["9"].extend(pick("Subject-means Shapiro-Wilk"))
-    details["9"].extend([l for l in log_lines if "log transform" in l.lower()])
+        grade["9"] = "B"
+        comment["9"] = "Distribution not assessed."
+    
+    details["9"].extend(pick("Normality"))
+    details["9"].extend(pick("Shapiro-Wilk"))
+    details["9"].extend(pick("log transform"))
     if not details["9"]:
-        details["9"].append("No normality/transform messages in log.")
+        details["9"].append("No normality messages in log.")
 
-    # ---------------- QI 10 (variance homogeneity) ----------------
+    # ---------------- QI 10 (Variance homogeneity) ----------------
+    # BIVAC Table 1:
+    # A: Yes - variance homogeneity examined
+    # C: No - variance homogeneity not examined
     wp_examined = flags.get("wp_bartlett", True)
-    het = any(("heterogeneous" in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
-    if wp_examined and not het:
-        grade["10"] = "A"; comment["10"] = "Variance homogeneity examined; acceptable."
+    rep_bartlett_examined = flags.get("rep_bartlett", True)
+    variance_homogeneity_examined = wp_examined or rep_bartlett_examined
+    
+    if variance_homogeneity_examined:
+        grade["10"] = "A"
+        het = any(("heterogeneous" in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
+        hom = any(("homogeneous" in l.lower()) and ("heterogeneous" not in l.lower()) and ("bartlett" in l.lower()) for l in log_lines)
+        if het:
+            comment["10"] = "Variance homogeneity examined; heterogeneous subjects handled."
+        elif hom:
+            comment["10"] = "Variance homogeneity examined; variances are homogeneous."
+        else:
+            comment["10"] = "Variance homogeneity examined."
     else:
-        grade["10"] = "C"; comment["10"] = "Variance homogeneity not examined or heterogeneous."
-    details["10"].extend(pick("QI 10", "Bartlett"))
-    details["10"].extend(pick("Within-subject Bartlett"))
-    details["10"].extend(pick("High within-subject variance"))
-    details["10"].extend(pick("Replicate Bartlett"))
+        grade["10"] = "C"
+        comment["10"] = "Variance homogeneity not examined."
+    
+    details["10"].extend(pick("Bartlett"))
+    details["10"].extend(pick("variance homogeneity"))
     if not details["10"]:
         details["10"].append("No variance-homogeneity messages in log.")
 
-    # ---------------- QI 11 (statistical method) ----------------
+    # ---------------- QI 11 (Statistical method) ----------------
+    # BIVAC Table 1:
+    # A: Nested ANOVA or equivalent variance decomposition with estimation of analytical, within-, and between-subject variation
+    # B: Simple subtraction of variances used
+    # C: Other method or method not declared
     grade["11"] = "A"
     if (res_.S == int(res_.S)) and (res_.R == int(res_.R)):
-        comment["11"] = "Nested ANOVA (balanced, closed-form)."
-        details["11"].append("Balanced crossed design; closed-form variance decomposition.")
+        comment["11"] = "Nested ANOVA with variance decomposition (balanced design)."
+        details["11"].append("Balanced crossed design; closed-form variance decomposition for CVₐ, CVᵢ, CVg.")
     else:
-        comment["11"] = "Variance decomposition on unbalanced data."
-        details["11"].append("Unbalanced design; method-of-moments variance decomposition.")
+        comment["11"] = "Variance decomposition (unbalanced data; method-of-moments estimation)."
+        details["11"].append("Unbalanced design; method-of-moments variance decomposition for CVₐ, CVᵢ, CVg.")
 
-    # ---------------- QI 12 (confidence limits) ----------------
-    grade["12"] = "A"
-    comment["12"] = "95% CIs for CVA/CVI/CVG provided."
-    details["12"].append(
-        f"CIs present: CVA {res_.ci_cv_A[0]:.2f}–{res_.ci_cv_A[1]:.2f}%, "
-        f"CVI {res_.ci_cv_I[0]:.2f}–{res_.ci_cv_I[1]:.2f}%, "
-        f"CVG {res_.ci_cv_G[0]:.2f}–{res_.ci_cv_G[1]:.2f}%."
-    )
+    # ---------------- QI 12 (Confidence limits) ----------------
+    # BIVAC Table 1:
+    # A: Yes - confidence limits around estimates of CVI presented
+    # C: No - confidence limits not presented
+    ci_available = (res_.ci_cv_I is not None and len(res_.ci_cv_I) == 2)
+    if ci_available:
+        grade["12"] = "A"
+        comment["12"] = "95% confidence limits for CVI presented."
+        details["12"].append(
+            f"CIs: CVₐ {res_.ci_cv_A[0]:.2f}–{res_.ci_cv_A[1]:.2f}%, "
+            f"CVᵢ {res_.ci_cv_I[0]:.2f}–{res_.ci_cv_I[1]:.2f}%, "
+            f"CVg {res_.ci_cv_G[0]:.2f}–{res_.ci_cv_G[1]:.2f}%."
+        )
+    else:
+        grade["12"] = "C"
+        comment["12"] = "Confidence limits not available."
+        details["12"].append("CIs could not be calculated.")
 
-    # ---------------- QI 13 (counts) ----------------
+    # ---------------- QI 13 (Number of results) ----------------
+    # BIVAC Table 1:
+    # A: Number of results given and exclusion criteria defined with number of exclusions
+    # B: Number of results and exclusion criteria given, but number excluded not stated
+    # C: Number of results not given, or exclusion criteria not given
     if (n_raw is not None) and (n_kept is not None):
         n_excl = max(n_raw - n_kept, 0)
         grade["13"] = "A"
-        comment["13"] = f"{n_kept} used / {n_raw} raw (excluded {n_excl})."
-        details["13"].extend(pick("results retained", "Balanced data set"))
-        details["13"].append(f"Kept {n_kept} of {n_raw} measurements.")
-    elif (n_kept is not None):
+        comment["13"] = f"Results: {n_kept} used / {n_raw} raw ({n_excl} excluded)."
+        details["13"].append(f"Kept {n_kept} of {n_raw} measurements; {n_excl} excluded by QC.")
+    elif n_kept is not None:
         grade["13"] = "B"
-        comment["13"] = f"{n_kept} results used (exclusions not documented)."
+        comment["13"] = f"{n_kept} results used; exclusion count not documented."
     else:
         grade["13"] = "C"
-        comment["13"] = "Counts not documented."
+        comment["13"] = "Number of results not documented."
 
-    # ---------------- QI 14 (mean) ----------------
-    grade["14"] = "A"
-    comment["14"] = (
-        f"Mean concentration reported ({res_.grand_mean:.2f}"
-        + (f" {unit}" if unit else "")
-        + ")."
-    )
-    details["14"].append(
-        f"Mean {res_.grand_mean:.2f}"
-        + (f" {unit}" if unit else "")
-        + f" (95% CI {res_.ci_mean[0]:.2f}–{res_.ci_mean[1]:.2f}"
-        + (f" {unit}" if unit else "")
-        + ")."
-    )
+    # ---------------- QI 14 (Mean/median concentration) ----------------
+    # BIVAC Table 1:
+    # A: Yes - mean/median concentration reported with reference interval
+    # B: Mean/median reported, reference interval not given
+    # C: Mean/median not reported
+    if res_.grand_mean is not None:
+        grade["14"] = "A"  # Always A if we have the mean (reference interval from CIs)
+        comment["14"] = (
+            f"Mean concentration: {res_.grand_mean:.2f}"
+            + (f" {unit}" if unit else "")
+            + f" (95% CI {res_.ci_mean[0]:.2f}–{res_.ci_mean[1]:.2f}"
+            + (f" {unit}" if unit else "")
+            + ")."
+        )
+        details["14"].append(
+            f"Mean = {res_.grand_mean:.2f}"
+            + (f" {unit}" if unit else "")
+            + f"; 95% CI = {res_.ci_mean[0]:.2f}–{res_.ci_mean[1]:.2f}"
+            + (f" {unit}" if unit else "")
+            + "."
+        )
+    else:
+        grade["14"] = "C"
+        comment["14"] = "Mean concentration not available."
 
     rows, overall = [], "A"
     for q in map(str, range(1, 15)):
@@ -807,6 +899,197 @@ def _detect_replicate_outliers(df: pd.DataFrame, alpha: float = 0.05) -> list[di
     return outliers
 
 
+def _detect_bartlett_outliers(df: pd.DataFrame, alpha: float = 0.05) -> list[dict]:
+    """
+    Detect Bartlett-based replicate outliers WITHOUT removing them.
+    Returns a list of dicts with outlier information for user selection.
+    
+    Similar to Cochran detection, but uses the Bartlett test.
+    Each dict contains:
+        - Subject: subject ID
+        - Sample: sample ID  
+        - replicates: list of {Replicate, Result} dicts
+        - variance: the sample variance of the replicate set
+        - chi2: Bartlett chi-squared statistic
+        - chi2_crit: critical value
+        - p: p-value
+    """
+    outliers = []
+    df_work = df.copy()
+    
+    while True:
+        valid_groups = []
+        group_keys = []
+        for (subj, samp), g in df_work.groupby(["Subject", "Sample"]):
+            if g["Result"].size < 2:
+                continue
+            if g["Result"].var(ddof=1) == 0:
+                continue
+            valid_groups.append(g["Result"].values)
+            group_keys.append((subj, samp))
+        
+        if len(valid_groups) < 3:
+            break
+        
+        with np.errstate(all="ignore"):
+            bart_stat, bart_p = bartlett(*valid_groups)
+        
+        k = len(valid_groups)
+        chi_crit = chi2.ppf(1 - alpha, k - 1)
+        
+        if bart_p >= alpha:
+            # Homogeneous - done
+            break
+        
+        # Heterogeneous - find worst offender
+        rep_var = (df_work.groupby(["Subject", "Sample"])["Result"]
+                   .var(ddof=1)
+                   .loc[group_keys])
+        
+        (subj, samp) = rep_var.idxmax()
+        max_var = rep_var.max()
+        
+        rep_data = df_work.loc[(df_work["Subject"] == subj) & (df_work["Sample"] == samp),
+                               ["Replicate", "Result"]].to_dict("records")
+        
+        outliers.append({
+            "Subject": subj,
+            "Sample": samp,
+            "replicates": rep_data,
+            "variance": float(max_var),
+            "chi2": float(bart_stat),
+            "chi2_crit": float(chi_crit),
+            "p": float(bart_p),
+        })
+        
+        # Remove this pair from working copy to find next outlier
+        df_work = df_work[~((df_work["Subject"] == subj) & (df_work["Sample"] == samp))]
+    
+    return outliers
+
+
+def _detect_sample_cochran_outliers(df: pd.DataFrame, alpha: float = 0.05) -> list[dict]:
+    """
+    Detect Sample-level Cochran outliers (QI 8b) within each subject.
+    Returns a list of dicts with outlier information for user selection.
+    
+    Iteratively detects outliers but does NOT permanent remove them from input df.
+    """
+    outliers = []
+    
+    # Process each subject separately
+    for subj, g_subj in df.groupby("Subject"):
+        g_work = g_subj.copy()
+        
+        while True:
+            # Calculate variance for each sample within subject
+            samp_var = g_work.groupby("Sample")["Result"].var(ddof=1).dropna()
+            
+            # Need at least 3 variances for Cochran
+            if samp_var.size < 3:
+                break
+                
+            r_per_sample = g_work.groupby("Sample")["Replicate"].nunique().mode().iat[0]
+            if r_per_sample < 2:
+                break
+                
+            c_res = _cochrans_test(samp_var.values, alpha, df=r_per_sample - 1)
+            
+            if not c_res.flag:
+                break
+                
+            # Outlier found
+            samp_out = samp_var.idxmax()
+            variance = samp_var.max()
+            
+            sample_data = g_work[g_work["Sample"] == samp_out]
+            
+            outliers.append({
+                "Subject": subj,
+                "Sample": samp_out,
+                "variance": variance,
+                "G": c_res.G,
+                "G_crit": c_res.G_crit,
+                "sample_data": sample_data[["Replicate", "Result"]].to_dict("records")
+            })
+            
+            # Remove from local work set to find next outlier
+            g_work = g_work[g_work["Sample"] != samp_out]
+            
+    return outliers
+
+
+def _detect_wp_bartlett_outliers(df: pd.DataFrame, alpha: float = 0.05) -> list[dict]:
+    """
+    Detect QI 10 within-subject variance Bartlett outliers WITHOUT removing them.
+    Returns a list of dicts with outlier information for user selection.
+    
+    Unlike QI 8a which tests replicate variances per sample, QI 10 tests
+    within-subject variances (variance of sample means within each subject)
+    across subjects.
+    
+    Each dict contains:
+        - Subject: subject ID
+        - within_subject_variance: the s²_WP for this subject
+        - sample_means: list of {Sample, Mean} dicts
+        - chi2: Bartlett chi-squared statistic
+        - chi2_crit: critical value
+        - p: p-value
+    """
+    outliers = []
+    df_work = df.copy()
+    
+    while True:
+        subj_groups = []
+        subj_keys = []
+        subj_vars = {}
+        
+        for subj, g in df_work.groupby("Subject"):
+            if g["Sample"].nunique() < 2:
+                continue
+            sample_means = g.groupby("Sample")["Result"].mean()
+            var_wp = sample_means.var(ddof=1)
+            if var_wp == 0:
+                continue
+            subj_groups.append(sample_means.values)
+            subj_keys.append(subj)
+            subj_vars[subj] = {
+                "variance": var_wp,
+                "sample_means": sample_means.reset_index().to_dict("records")
+            }
+        
+        if len(subj_groups) < 3:
+            break
+        
+        with np.errstate(all="ignore"):
+            bart_stat, bart_p = bartlett(*subj_groups)
+        
+        k = len(subj_groups)
+        chi_crit = chi2.ppf(1 - alpha, k - 1)
+        
+        if bart_p >= alpha:
+            # Homogeneous - done
+            break
+        
+        # Heterogeneous - find worst offender (highest within-subject variance)
+        worst_subj = max(subj_vars.keys(), key=lambda s: subj_vars[s]["variance"])
+        worst_info = subj_vars[worst_subj]
+        
+        outliers.append({
+            "Subject": worst_subj,
+            "within_subject_variance": worst_info["variance"],
+            "sample_means": worst_info["sample_means"],
+            "chi2": float(bart_stat),
+            "chi2_crit": float(chi_crit),
+            "p": float(bart_p),
+        })
+        
+        # Remove this subject from working copy to find next outlier
+        df_work = df_work[df_work["Subject"] != worst_subj]
+    
+    return outliers
+
+
 def _reed_outlier(values: np.ndarray) -> int | None:
     """
     Implements Reed’s criterion:
@@ -826,6 +1109,88 @@ def _reed_outlier(values: np.ndarray) -> int | None:
     if (s_val[1] - s_val[0]) > rng / 3:
         return int(s_idx[0])
     return None
+
+
+def _detect_reed_outliers(df: pd.DataFrame) -> list[dict]:
+    """
+    Detect Reed between-subject outlier candidates (QI 8c).
+    Returns list of dicts with outlier info (Subject, Mean, Reason).
+    """
+    outliers = []
+    df_work = df.copy()
+    
+    while True:
+        subj_mean = df_work.groupby("Subject")["Result"].mean()
+        if subj_mean.size < 3:
+            break
+            
+        ridx = _reed_outlier(subj_mean.values)
+        if ridx is None:
+            break
+            
+        culprit = subj_mean.index[ridx]
+        mean_val = subj_mean.iloc[ridx]
+        
+        # Re-calc details for UI context
+        values = subj_mean.values
+        s_idx = np.argsort(values)
+        s_val = values[s_idx]
+        rng = s_val[-1] - s_val[0]
+        threshold = rng / 3.0
+        
+        diff_high = s_val[-1] - s_val[-2]
+        diff_low = s_val[1] - s_val[0]
+        
+        reason = "Outlier"
+        if (diff_high > threshold) and (subj_mean.index[s_idx[-1]] == culprit):
+            reason = f"High-end gap ({diff_high:.2f}) > Range/3 ({threshold:.2f})"
+        elif (diff_low > threshold) and (subj_mean.index[s_idx[0]] == culprit):
+            reason = f"Low-end gap ({diff_low:.2f}) > Range/3 ({threshold:.2f})"
+            
+        outliers.append({
+            "Subject": culprit,
+            "mean": mean_val,
+            "range": rng,
+            "threshold": threshold,
+            "reason": reason
+        })
+        
+        df_work = df_work[df_work["Subject"] != culprit]
+        
+    return outliers
+
+
+def _detect_drift_outliers(df: pd.DataFrame) -> list[dict]:
+    """
+    Detect Steady-State Drift (QI 7) outliers per subject.
+    Returns list of dicts with drift info (Subject, Slope, CI, p-value).
+    """
+    outliers = []
+    tinv = lambda p, d: abs(t.ppf(p/2, d))
+    
+    for subj, g in df.groupby("Subject"):
+        if g["Sample"].nunique() <= 2:
+            continue
+            
+        res = linregress(g["Sample"], g["Result"])
+        df_denom = len(g) - 2
+        
+        if df_denom <= 0: continue
+        
+        if res.pvalue < 0.05:
+            ts = tinv(0.05, df_denom)
+            ci_low = res.slope - ts * res.stderr
+            ci_high = res.slope + ts * res.stderr
+            
+            outliers.append({
+                "Subject": subj,
+                "slope": res.slope,
+                "p": res.pvalue,
+                "ci": (ci_low, ci_high),
+                "n_points": len(g)
+            })
+            
+    return outliers
 
 
 
@@ -906,7 +1271,12 @@ def _preprocess_bv_dataframe(
         normal_p: float = 0.05,
         enforce_balance: bool = True,
         flags: dict[str, bool] | None = None,
-        rep_outlier_selections: dict | None = None,  # user selections for replicate outliers
+        rep_outlier_selections: dict | None = None,  # user selections for replicate outliers  (Cochran)
+        rep_bartlett_selections: dict | None = None, # user selections for Bartlett outliers
+        samp_cochran_selections: dict | None = None, # user selections for Sample level Cochran (QI 8b)
+        wp_bartlett_selections: dict | None = None,  # user selections for QI 10 within-subject Bartlett
+        reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
+        drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
@@ -1033,125 +1403,267 @@ def _preprocess_bv_dataframe(
     # ─────────────────────────────────────────────────────────────────────────
     if ON("rep_bartlett"):
 
-        valid_groups = []
-        group_keys    = []                        # (Subject, Sample) anahtarlarını da tut
-        for (subj, samp), g in df.groupby(["Subject", "Sample"]):
-            if g["Result"].size < 2:              # Bartlett için ≥2 ölçüm şart
-                continue
-            if g["Result"].var(ddof=1) == 0:      # Excel: s² = 0 olan çiftleri hariç tutar
-                continue
-            valid_groups.append(g["Result"].values)
-            group_keys.append((subj, samp))
+        while True:
+            valid_groups = []
+            group_keys    = []                        # Keep (Subject, Sample) keys
+            for (subj, samp), g in df.groupby(["Subject", "Sample"]):
+                if g["Result"].size < 2:              # Bartlett needs >=2 measurements
+                    continue
+                if g["Result"].var(ddof=1) == 0:      # Exclude pairs with s² = 0
+                    continue
+                valid_groups.append(g["Result"].values)
+                group_keys.append((subj, samp))
 
-        if len(valid_groups) >= 3:                # Bartlett ≥3 grup ister
-            with np.errstate(all="ignore"):       # sabit giriş uyarılarını bastır
-                bart_stat, bart_p = bartlett(*valid_groups)
-            rep_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
-            k = len(valid_groups)
-            chi_crit = chi2.ppf(1 - alpha, k - 1)
+            if len(valid_groups) >= 3:                # Bartlett needs >=3 groups
+                with np.errstate(all="ignore"):       # suppress constant input warnings
+                    bart_stat, bart_p = bartlett(*valid_groups)
+                rep_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
+                k = len(valid_groups)
+                chi_crit = chi2.ppf(1 - alpha, k - 1)
 
-            log.append(
-                f"QI 8a – Bartlett test (replicate sets): "
-                f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
-                f"p = {bart_p:.4f} → variances {rep_msg}."
-            )
+                log.append(
+                    f"QI 8a – Bartlett test (replicate sets): "
+                    f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
+                    f"p = {bart_p:.4f} → variances {rep_msg}."
+                )
 
-            # Excel’de olduğu gibi: heterojen ise en yüksek 5 s²’yi raporla
-            if bart_p < alpha:
-                rep_var = (df.groupby(["Subject", "Sample"])["Result"]
-                            .var(ddof=1)
-                            .loc[group_keys])     # yalnızca teste giren çiftler
-                top_bad = rep_var.sort_values(ascending=False).head(5)
-                for (subj, samp), v in top_bad.items():
-                    log.append(
-                        f"  High analytical variance → "
-                        f"Subject {subj}, Sample {samp}  (s² = {v:.4f})"
-                    )
-        else:
-            log.append(
-                "QI 8a – Bartlett test (replicate sets) skipped: "
-                "fewer than 3 valid replicate groups."
-            )
+                if bart_p < alpha:
+                    # Identify outlier variances
+                    rep_var = (df.groupby(["Subject", "Sample"])["Result"]
+                                .var(ddof=1)
+                                .loc[group_keys])     # only those included in test
+                    
+                    if ON("rep_bartlett_exclusion"):
+                        # Iterative exclusion: identify worst offender
+                        (bad_subj, bad_samp), max_v = rep_var.idxmax(), rep_var.max()
+
+                        # Check if user has a stored decision for this specific outlier
+                        rep_bartlett_selections = rep_bartlett_selections or {}
+                        action = rep_bartlett_selections.get((bad_subj, bad_samp), "remove_all")
+
+                        if action == "ignore":
+                            log.append(
+                                f"  → Bartlett outlier ignored (user selection): "
+                                f"Subject {bad_subj}, Sample {bad_samp} (s² = {max_v:.4f}). "
+                                "Heterogeneity accepted."
+                            )
+                            # Stop the loop -> accept current state (heterogeneous)
+                            break
+                        
+                        elif action == "remove_all":
+                            log.append(
+                                f"  → Removing highest analytical variance outlier: "
+                                f"Subject {bad_subj}, Sample {bad_samp} (s² = {max_v:.4f})"
+                            )
+                            df = df[~((df["Subject"] == bad_subj) & (df["Sample"] == bad_samp))]
+                            continue # Loop again
+
+                        elif action.startswith("keep_rep_"):
+                            rep_to_keep = action.replace("keep_rep_", "")
+                            try:
+                                rep_to_keep = int(float(rep_to_keep))
+                            except ValueError:
+                                pass
+                            
+                            mask = (df["Subject"] == bad_subj) & (df["Sample"] == bad_samp)
+                            keep_mask = mask & (df["Replicate"] == rep_to_keep)
+                            kept_val = df.loc[keep_mask, "Result"]
+                            
+                            log.append(
+                                f"  → Bartlett outlier: kept Replicate {rep_to_keep} (user selection) for "
+                                f"Subject {bad_subj}, Sample {bad_samp}."
+                            )
+                            # Keep only that replicate for this sample (effectively variance -> 0 or NaN if <2 reps)
+                            # If only 1 replicate remains, it will be excluded from next Bartlett check (size < 2 check)
+                            df = df[~mask | keep_mask]
+                            continue
+                        
+                        else:
+                            # Fallback default
+                            log.append(f"  → Removing outlier (default): Subject {bad_subj}, Sample {bad_samp}")
+                            df = df[~((df["Subject"] == bad_subj) & (df["Sample"] == bad_samp))]
+                            continue
+
+                    else:
+                        # Report only (Default behavior)
+                        top_bad = rep_var.sort_values(ascending=False).head(5)
+                        for (subj, samp), v in top_bad.items():
+                            log.append(
+                                f"  High analytical variance → "
+                                f"Subject {subj}, Sample {samp}  (s² = {v:.4f})"
+                            )
+                        break 
+                else:
+                    # Homogeneous - done
+                    break
+            else:
+                log.append(
+                    "QI 8a – Bartlett test (replicate sets) skipped (or stopped): "
+                    "fewer than 3 valid replicate groups."
+                )
+                break
     else:
         log.append("Replicate Bartlett (QI 8a) skipped (switch off).")
 
     # ── QI 8b – sample‑level Cochran inside each subject ──────────────────
     if ON("samp_cochran"):
+        # 1. Apply user selections (if any)
+        if samp_cochran_selections:
+            for key, action in samp_cochran_selections.items():
+                subj, samp = key
+                mask = (df["Subject"] == subj) & (df["Sample"] == samp)
+                if not mask.any(): continue
+                
+                vals = df.loc[mask, "Result"]
+                variance = df.loc[mask, "Result"].var(ddof=1)
+                
+                if action == "remove":
+                    log.append(f"QI 8b – sample Cochran outlier removed (user selection) → Subject {subj}, Sample {samp} (s²={variance:.4f})")
+                    df = df[~mask]
+                elif action == "ignore":
+                     log.append(f"QI 8b – sample Cochran outlier ignored (user selection) → Subject {subj}, Sample {samp} (s²={variance:.4f})")
 
-        changed = True
-        while changed:
-            changed = False
-            for subj, g in df.groupby("Subject"):
-
-                samp_var = g.groupby("Sample")["Result"].var(ddof=1).dropna()
-
-                # (3) ensure we log even when the test is impossible
-                if samp_var.size < 3:
-                    log.append(f"QI 8b – Cochran skipped (Subject {subj}): <3 variances.")
-                    continue
-
-                r_per_sample = g.groupby("Sample")["Replicate"].nunique().mode().iat[0]
-
-                # (2) Cochran undefined if only one replicate
-                if r_per_sample < 2:
-                    log.append(f"QI 8b – Cochran skipped (Subject {subj}): only 1 replicate.")
-                    continue
-
-                c_res = _cochrans_test(samp_var.values, alpha, df=r_per_sample - 1)
-
-                # single universal log line
-                log.append(
-                    f"QI 8b – Cochran (Subject {subj}): "
-                    f"G = {c_res.G:.3f}, Gcrit = {c_res.G_crit:.3f}"
-                    + (" → OUTLIER" if c_res.flag else " → no outlier detected")
-                )
-
-                if not c_res.flag:
-                    continue  # nothing to remove – next subject
-
-                # remove the offending sample
-                samp = samp_var.idxmax()
-                vals = df.loc[(df["Subject"] == subj) & (df["Sample"] == samp), "Result"]
-                log.append(
-                    f"QI 8b – sample Cochran outlier removed → "
-                    f"Subject {subj}, Sample {samp}: "
-                    + ", ".join(f"{v:.2f}" for v in vals) +
-                    f"  (s² = {samp_var.max():.4f})"
-                )
+        # 2. Auto Mode: Detect and remove all outliers
+        if flags.get("outlier_mode") != "manual":
+            auto_outliers = _detect_sample_cochran_outliers(df, alpha)
+            for out in auto_outliers:
+                subj, samp = out["Subject"], out["Sample"]
+                vals_str = ", ".join(f"{r['Result']:.2f}" for r in out["sample_data"])
+                log.append(f"QI 8b – sample Cochran outlier removed (auto) → Subject {subj}, Sample {samp}: {vals_str} (s²={out['variance']:.4f})")
                 df = df[~((df["Subject"] == subj) & (df["Sample"] == samp))]
-                changed = True
-                break   # restart because groupby cache is stale
+
+        # 3. Final Verification / Logging Pass (Check status of retained data)
+        for subj, g in df.groupby("Subject"):
+            samp_var = g.groupby("Sample")["Result"].var(ddof=1).dropna()
+            
+            if samp_var.size < 3:
+                log.append(f"QI 8b – Cochran skipped (Subject {subj}): <3 variances.")
+                continue
+                
+            r_per_sample = g.groupby("Sample")["Replicate"].nunique().mode().iat[0]
+            if r_per_sample < 2:
+                log.append(f"QI 8b – Cochran skipped (Subject {subj}): only 1 replicate.")
+                continue
+                
+            c_res = _cochrans_test(samp_var.values, alpha, df=r_per_sample - 1)
+            
+            status = " → OUTLIER (Retained/Ignored)" if c_res.flag else " → no outlier detected"
+            log.append(f"QI 8b – Cochran (Subject {subj}): G = {c_res.G:.3f}, Gcrit = {c_res.G_crit:.3f}{status}")
     else:
         log.append("Sample Cochran (QI 8b) skipped (switch off).")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # QI 10 – Within-subject Bartlett (variance homogeneity across subjects)
+    # ════════════════════════════════════════════════════════════════════════
+    if ON("wp_bartlett"):
+        wp_bartlett_selections = wp_bartlett_selections or {}
+        
+        while True:
+            subj_groups = []
+            subj_keys = []
+            subj_vars = {}
+            
+            for subj, g in df.groupby("Subject"):
+                if g["Sample"].nunique() < 2:
+                    continue
+                sample_means = g.groupby("Sample")["Result"].mean()
+                var_wp = sample_means.var(ddof=1)
+                if var_wp == 0:
+                    continue
+                subj_groups.append(sample_means.values)
+                subj_keys.append(subj)
+                subj_vars[subj] = var_wp
+            
+            if len(subj_groups) < 3:
+                log.append(
+                    "QI 10 – Bartlett test (within‑subject variances) skipped: "
+                    "fewer than 3 eligible subjects."
+                )
+                break
+            
+            with np.errstate(all="ignore"):
+                bart_stat, bart_p = bartlett(*subj_groups)
+            
+            k = len(subj_groups)
+            chi_crit = chi2.ppf(1 - alpha, k - 1)
+            wp_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
+            
+            log.append(
+                f"QI 10 – Bartlett test (within‑subject variances): "
+                f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
+                f"p = {bart_p:.4f} → variances {wp_msg}."
+            )
+            
+            if bart_p >= alpha:
+                # Homogeneous - done
+                break
+            
+            # Heterogeneous - check if exclusion is enabled
+            if ON("wp_bartlett_exclusion"):
+                # Find worst offender
+                worst_subj = max(subj_vars.keys(), key=lambda s: subj_vars[s])
+                max_var = subj_vars[worst_subj]
+                
+                # Check user selection
+                action = wp_bartlett_selections.get(worst_subj, "remove")
+                
+                if action == "ignore":
+                    log.append(
+                        f"  → QI 10 outlier ignored (user selection): "
+                        f"Subject {worst_subj} (s²_WP = {max_var:.4f}). "
+                        "Heterogeneity accepted."
+                    )
+                    break
+                elif action == "remove":
+                    log.append(
+                        f"  → Removing highest within-subject variance: "
+                        f"Subject {worst_subj} (s²_WP = {max_var:.4f})"
+                    )
+                    df = df[df["Subject"] != worst_subj]
+                    continue
+                else:
+                    # Fallback - remove
+                    log.append(f"  → Removing outlier (default): Subject {worst_subj}")
+                    df = df[df["Subject"] != worst_subj]
+                    continue
+            else:
+                # Report only (no exclusion enabled)
+                for subj, v in sorted(subj_vars.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    log.append(
+                        f"  High within‑subject variance → Subject {subj}  (s² = {v:.4f})"
+                    )
+                break
+    else:
+        log.append("Within‑subject Bartlett (QI 10) skipped (switch off).")
+
     # ── QI 8c – between‑subject Reed test only ────────────────────────────────
     if ON("reed"):
+        # 1. Apply user selections (if any)
+        if reed_selections:
+            for subj, action in reed_selections.items():
+                if action == "remove":
+                    log.append(f"QI 8c – Reed outlier removed (user selection) → Subject {subj}")
+                    df = df[df["Subject"] != subj]
+                elif action == "ignore":
+                    log.append(f"QI 8c – Reed outlier ignored (user selection) → Subject {subj}")
 
-        removed_any = False          # ① NEW – keeps track of removals
-
-        while True:
-            subj_mean = df.groupby("Subject")["Result"].mean()
-            ridx      = _reed_outlier(subj_mean.values)
-
+        # 2. Auto Mode
+        if flags.get("outlier_mode") != "manual":
+            auto_reed = _detect_reed_outliers(df)
+            for out in auto_reed:
+                subj = out["Subject"]
+                log.append(f"QI 8c – Reed mean outlier removed (auto) → Subject {subj} (mean={out['mean']:.4f})")
+                df = df[df["Subject"] != subj]
+        
+        # 3. Final Verification
+        subj_mean = df.groupby("Subject")["Result"].mean()
+        if subj_mean.size >= 3:
+            ridx = _reed_outlier(subj_mean.values)
             if ridx is None:
-                # no new outlier found → exit loop …
-                if not removed_any:  # ② NEW – log only if the very first check already passed
-                    log.append("QI 8c – Reed test passed: no between‑subject outliers.")
-                break
-
-            removed_any = True       # mark that we did remove something
-
-            culprit = subj_mean.index[ridx]
-            vals    = df.loc[df["Subject"] == culprit, "Result"]
-
-            log.append(
-                f"QI 8c – Reed mean outlier → removed Subject {culprit} "
-                f"(mean = {subj_mean.iloc[ridx]:.2f}; values: "
-                + ", ".join(f"{v:.2f}" for v in vals) + ")"
-            )
-            df = df[~df["Subject"].eq(culprit)]
-            if removed_any:
-                log.append("QI 8c – Reed test complete: no further between-subject outliers.")
+                log.append("QI 8c – Reed test passed: no between‑subject outliers.")
+            else:
+                culprit = subj_mean.index[ridx]
+                log.append(f"QI 8c – Reed outlier identified (retained/ignored): Subject {culprit}.")
     else:
         log.append("Reed between‑subject (QI 8c) skipped (switch off).")
 
@@ -1160,45 +1672,33 @@ def _preprocess_bv_dataframe(
     # 0 b.  Steady‑state trend test (QI 7) – slope ± 95 % CI
     # ════════════════════════════════════════════════════════════════════════
     if ON("drift"):
+        # 1. Apply user selections (if any)
+        if drift_selections:
+            for subj, action in drift_selections.items():
+                if action == "remove":
+                    log.append(f"QI 7 – Drift outlier removed (user selection) → Subject {subj}")
+                    df = df[df["Subject"] != subj]
+                elif action == "ignore":
+                    log.append(f"QI 7 – Drift outlier ignored (user selection) → Subject {subj}")
 
-        tinv = lambda p, df: abs(t.ppf(p/2, df))        # two‑sided t‑quantile
-        drift_records = []                               # list of dicts
-
-        for subj, g in df.groupby("Subject"):
-            # need at least three time‑points for a slope
-            if g["Sample"].nunique() <= 2:
-                continue
-
-            res = linregress(g["Sample"], g["Result"])
-            df_denom = len(g) - 2                       # regression d.f.
-            if df_denom <= 0:
-                continue
-
-            ts = tinv(0.05, df_denom)                   # 95 % two‑sided
-            ci_low  = res.slope - ts * res.stderr
-            ci_high = res.slope + ts * res.stderr
-
-            if res.pvalue < 0.05:                       # significant drift
-                drift_records.append(
-                    dict(subj=subj,
-                        slope=res.slope,
-                        p=res.pvalue,
-                        ci=(ci_low, ci_high))
-                )
-
-        # ── write log + drop drifting subjects *once* ───────────────────────
-        if drift_records:
-            for d in drift_records:
+        # 2. Auto Mode
+        if flags.get("outlier_mode") != "manual":
+            auto_drift = _detect_drift_outliers(df)
+            for out in auto_drift:
+                subj = out["Subject"]
                 log.append(
-                    "QI 7 – temporal drift: Subject {subj} slope = {s:+.3g} "
-                    "(95 % CI {lo:.3g}–{hi:.3g}, p = {p:.3g}) – excluded."
-                    .format(subj=d["subj"], s=d["slope"],
-                            lo=d["ci"][0], hi=d["ci"][1], p=d["p"])
+                    f"QI 7 – temporal drift removed (auto): Subject {subj} "
+                    f"slope={out['slope']:.3g} (p={out['p']:.3g})"
                 )
+                df = df[df["Subject"] != subj]
 
-            df = df[~df["Subject"].isin([d["subj"] for d in drift_records])]
-            log.append(f"Total subjects excluded for drift (QI 7): {len(drift_records)}")
-
+        # 3. Final Verification
+        final_drifts = _detect_drift_outliers(df)
+        if not final_drifts:
+            log.append("QI 7 – Steady-state drift test passed: no trend outliers.")
+        else:
+            log.append(f"QI 7 – Drift outliers identified (retained/ignored): {len(final_drifts)} subjects.")
+            
     else:
         log.append("Steady‑state drift (QI 7) skipped (switch off).")
 
@@ -1273,67 +1773,16 @@ def _preprocess_bv_dataframe(
                 transformed  = True
                 log.append("Natural‑log transform applied after subject‑mean SW failure.")
                 means = df.groupby("Subject")["Result"].mean()
-                if shapiro(means)[1] <= normal_p:
-                    raise ValueError("Normality could not be achieved – stopping.")
+                p_sw_log = shapiro(means)[1]
+                if p_sw_log <= normal_p:
+                    log.append(f"WARNING: Normality could not be achieved even after log-transform (p={p_sw_log:.3g}) – (Proceeding with log-data, but interpretation requires caution).")
             elif p_sw <= normal_p:
-                raise ValueError("Normality could not be achieved even after log‑transform.")
+                log.append(f"WARNING: Normality could not be achieved (p={p_sw:.3g}) – (Proceeding, but interpretation requires caution).")
     else:
         log.append("Normality checks / log‑transform (QI 9) skipped (switch off).")  
 
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 3.  Variance‑homogeneity *across subjects*  (Bartlett, QI 10 – Excel uyumlu)
-    #     Excel mantığı:
-    #       ① Her denekte (Subject) önce replicates ortalaması alınır →
-    #          her örnek (Sample) tek bir değere iner → analitik gürültü elenir.
-    #       ② Aynı deneğin ≥2 örneği varsa bunların varyansı s²_WP hesaplanır.
-    #       ③ Bartlett testi ≥3 deneklik {s²_WP} kümesine uygulanır.
-    # ════════════════════════════════════════════════════════════════════════
-    if ON("wp_bartlett"):
 
-        subj_groups = []          # Bartlett’e girecek her deneğin “örnek ortalamaları”
-        subj_keys   = []          # Aynı sırayla Subject ID tut (rapor log’u için)
-
-        for subj, g in df.groupby("Subject"):
-            if g["Sample"].nunique() < 2:      # Bartlett için denek başına ≥2 örnek gerek
-                continue
-            sample_means = g.groupby("Sample")["Result"].mean().values
-            if sample_means.var(ddof=1) == 0:  # Excel: varyans sıfırsa deneği test dışı bırakır
-                continue
-            subj_groups.append(sample_means)
-            subj_keys.append(subj)
-
-        if len(subj_groups) >= 3:              # Bartlett ≥3 grup ister
-            with np.errstate(all="ignore"):    # sabit grup uyarılarını bastır
-                bart_stat, bart_p = bartlett(*subj_groups)
-            wp_msg = "heterogeneous" if bart_p < alpha else "homogeneous"
-            k = len(subj_groups)
-            chi_crit = chi2.ppf(1 - alpha, k - 1)
-
-            log.append(
-                f"QI 10 – Bartlett test (within‑subject variances): "
-                f"χ² = {bart_stat:.2f}, χ²crit = {chi_crit:.2f}, "
-                f"p = {bart_p:.4f} → variances {wp_msg}."
-            )
-
-            # If p < alpha, report the top 5 highest within-subject variances (s²_WP)
-            if bart_p < alpha:
-                wp_var = {
-                    subj: g.groupby("Sample")["Result"].mean().var(ddof=1)
-                    for subj, g in df.groupby("Subject") if subj in subj_keys
-                }
-                for subj, v in sorted(wp_var.items(), key=lambda x: x[1], reverse=True)[:5]:
-                    log.append(
-                        f"  High within‑subject variance → Subject {subj}  (s² = {v:.4f})"
-                    )
-        else:
-            log.append(
-                "QI 10 – Bartlett test (within‑subject variances) skipped: "
-                "fewer than 3 eligible subjects."
-            )
-    else:
-        log.append("Within‑subject Bartlett (QI 10) skipped (switch off).")  
-    
     # ════════════════════════════════════════════════════════════════════════
     # 4.  Force a perfectly balanced design for the ANOVA
     # ════════════════════════════════════════════════════════════════════════
@@ -1737,7 +2186,12 @@ def _calculate_bv_unbalanced(df: pd.DataFrame,
 def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
                  use_cv_anova: bool = False,
                  enforce_balance: bool = True,
-                 rep_outlier_selections: dict | None = None,  # user selections for replicate outliers
+                 rep_outlier_selections: dict | None = None,  # user selections for replicate outliers (Cochran)
+                 rep_bartlett_selections: dict | None = None, # user selections for Bartlett outliers
+                 samp_cochran_selections: dict | None = None, # user selections for Sample level Cochran (QI 8b)
+                 wp_bartlett_selections: dict | None = None,  # user selections for QI 10 within-subject Bartlett
+                 reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
+                 drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
 ) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
@@ -1749,8 +2203,23 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
     alpha : float
         Significance level for the CI on CV_I (0.05 → 95 % CI).
     rep_outlier_selections : dict | None
-        User selections for how to handle detected replicate outliers.
+        User selections for how to handle detected replicate outliers (Cochran).
         Keys are (Subject, Sample) tuples, values are actions like "remove_all", "ignore", or "keep_rep_N".
+    rep_bartlett_selections : dict | None
+        User selections for how to handle Bartlett outliers.
+        Keys are (Subject, Sample) tuples, values are actions like "remove_all", "ignore", or "keep_rep_N".
+    samp_cochran_selections : dict | None
+        User selections for Sample level Cochran outliers.
+        Keys are (Subject, Sample) tuples, values are "remove" or "ignore".
+    wp_bartlett_selections : dict | None
+        User selections for QI 10 within-subject Bartlett outliers.
+        Keys are Subject IDs, values are "remove" or "ignore".
+    reed_selections : dict | None
+        User selections for Reed outliers (QI 8c).
+        Keys are Subject IDs, values are "remove" or "ignore".
+    drift_selections : dict | None
+        User selections for Steady-state drift (QI 7).
+        Keys are Subject IDs, values are "remove" or "ignore".
     """
 
     
@@ -1774,6 +2243,11 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             enforce_balance=enforce_balance, 
             flags=st.session_state.get("preproc_flags"),
             rep_outlier_selections=rep_outlier_selections,
+            rep_bartlett_selections=rep_bartlett_selections,
+            samp_cochran_selections=samp_cochran_selections,
+            wp_bartlett_selections=wp_bartlett_selections,
+            reed_selections=reed_selections,
+            drift_selections=drift_selections,
         )
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
@@ -2388,35 +2862,70 @@ with st.sidebar:
     # ─────────────────────────────────────────────────────────────
     # Pre‑processing switches – default = all ON
     # ─────────────────────────────────────────────────────────────
-    st.sidebar.subheader("Pre‑processing steps")
+    st.sidebar.subheader("Outlier Exclusion")
 
-    PREPROC_OPTS = {
-        # label                        internal key            default
-        "Replicate Cochran (QI 8a)"  : ("rep_cochran",          True),
-        "Replicate Bartlett (QI 8a)" : ("rep_bartlett",         True),
-        "Sample Cochran (QI 8b)"     : ("samp_cochran",         True),
-        "Reed between‑subject (QI 8c)":("reed",                 True),
-        "Steady‑state drift (QI 7)"  : ("drift",                True),
-        "Population drift (QI 7)": ("pop_drift",                False),
-        "Normality checks / log‑transform (QI 9)"
-                                    : ("normality",           True),
-        "Within‑subject Bartlett (QI 10)"
-                                    : ("wp_bartlett",         True),
+
+    # Mode selector: Exclude all vs Manual review
+    outlier_mode = st.sidebar.radio(
+        "Outlier handling mode:",
+        ["🔄 Exclude all outliers (automatic)", "🔍 Manually review outliers"],
+        index=0,
+        help="Choose whether to automatically exclude all detected outliers or review each one individually."
+    )
+    st.session_state["outlier_mode"] = "auto" if outlier_mode.startswith("🔄") else "manual"
+    
+    # Outlier exclusion checkboxes (in specified order)
+    OUTLIER_OPTS = {
+        "Replicate level Cochran (QI 8a)"     : ("rep_cochran",   True),
+        "Replicate level Bartlett (QI 8a)"    : ("rep_bartlett",  True),
+        "Sample level Cochran (QI 8b)"        : ("samp_cochran",  True),
+        "Within-subject Bartlett (QI 10)"     : ("wp_bartlett",   True),
+        "Reed between-subject (QI 8c)"        : ("reed",          True),
+        "Steady-state drift (QI 7)"           : ("drift",         True),
     }
-
-    # build the check‑boxes and stash the chosen flags in session_state
+    
     preproc_flags = {}
-    for label, (key, default) in PREPROC_OPTS.items():
+    for label, (key, default) in OUTLIER_OPTS.items():
         preproc_flags[key] = st.sidebar.checkbox(label, value=default)
+    
+    # QI 7: If drift is NOT selected, ask if trend analysis is important
+    if not preproc_flags.get("drift", True):
+        qi7_importance = st.sidebar.radio(
+            "Is trend analysis important for this measurand?",
+            options=["Unlikely important (Grade B)", "May be important (Grade C)"],
+            index=1,  # Default to Grade C (conservative)
+            help="BIVAC QI 7: If trend analysis is not performed, grade depends on importance for the measurand."
+        )
+        st.session_state["qi7_importance"] = "B" if "Grade B" in qi7_importance else "C"
+    else:
+        st.session_state["qi7_importance"] = "A"  # Drift test performed = Grade A
+    
+    # Further Analysis Section
+    st.sidebar.subheader("Further Analysis")
+    ANALYSIS_OPTS = {
+        "Normality checks / log-transform (QI 9)" : ("normality", True),
+        "Population drift (QI 7)"                 : ("pop_drift", False),
+    }
+    for label, (key, default) in ANALYSIS_OPTS.items():
+        preproc_flags[key] = st.sidebar.checkbox(label, value=default)
+    
+    # Implicitly enable exclusion logic if the parent check is ON
+    preproc_flags["rep_bartlett_exclusion"] = preproc_flags.get("rep_bartlett", False)
+    preproc_flags["wp_bartlett_exclusion"] = preproc_flags.get("wp_bartlett", False)
+    
+    # Include QI 7 importance setting
+    preproc_flags["qi7_importance"] = st.session_state.get("qi7_importance", "C")
+    
+    preproc_flags["outlier_mode"] = st.session_state.get("outlier_mode", "auto")
     st.session_state["preproc_flags"] = preproc_flags
 
-    # Crossed design balance enforcement
-    st.sidebar.subheader("Analysis options")                    # NEW
-    enforce_balance = st.sidebar.checkbox(                      # NEW
-        "Enforce balanced crossed design",                      # NEW
-        value=True,                                             # NEW (default keeps old behaviour)
-    )                                                           # NEW
-    st.session_state["enforce_balance"] = enforce_balance       # NEW
+    # Analysis Options Section
+    st.sidebar.subheader("Analysis Options")
+    enforce_balance = st.sidebar.checkbox(
+        "Enforce balanced crossed design",
+        value=True,
+    )
+    st.session_state["enforce_balance"] = enforce_balance
 
     st.subheader("Need an example file?")
     with open('./template/bv_data_template.xlsx', "rb") as template_file:
@@ -2681,8 +3190,8 @@ if user_df is not None:
 
 
 
-    # --- BIVAC QI 1–5 manual entry (appears before Calculate) ---
-    with st.expander("⇢ BIVAC – Manual entry for QI 1–5 (study design & methods)", expanded=False):
+    # --- BIVAC QI 1–6 manual entry (appears before Calculate) ---
+    with st.expander("⇢ BIVAC – Manual entry for QI 1–6 (study design & methods)", expanded=False):
         if "qi_manual" not in st.session_state:
             st.session_state.qi_manual = {}
 
@@ -2696,18 +3205,10 @@ if user_df is not None:
                     "Select grade",
                     options=list(cfg["options"].keys()),
                     index=0,
-                    format_func=lambda k: f"{k} – {cfg['options'][k]}",
-                    key=f"qi15_{label}",
+                    format_func=lambda k, cfg=cfg: f"{k} – {cfg['options'][k]}",
+                    key=f"qi16_{label}",
                 )
             st.session_state.qi_manual[label] = choice
-
-        # ← ADD THESE TWO LINES HERE
-        same_run = st.checkbox(
-            "Replicates for each subject were analyzed in the same run",
-            value=True,
-            help="BIVAC QI6 demands same-run duplicate analysis for A grade."
-        )
-        st.session_state.qi_manual["QI 6 – same run"] = same_run
 
         st.info("These selections will be included in the checklist and overall BIVAC grade.")
         st.info("**When using BIVAC, please cite the following reference:** *Aarsand AK, Røraas T, Fernandez-Calle P, Ricos C, Díaz-Garzón J, Jonker N, Perich C, González-Lao E, Carobene A, Minchinela J, Coşkun A, Simón M, Álvarez V, Bartlett WA, Fernández-Fernández P, Boned B, Braga F, Corte Z, Aslan B, Sandberg S; European Federation of Clinical Chemistry and Laboratory Medicine Working Group on Biological Variation and Task and Finish Group for the Biological Variation Database. The Biological Variation Data Critical Appraisal Checklist: A Standard for Evaluating Studies on Biological Variation. Clin Chem. 2018 Mar;64(3):501-514. doi: 10.1373/clinchem.2017.281808. Epub 2017 Dec 8. PMID: 29222339.*")
@@ -2720,86 +3221,95 @@ if user_df is not None:
     # ─────────────────────────────────────────────────────────────
     # Replicate-level outlier detection and user selection UI
     # ─────────────────────────────────────────────────────────────
-    if st.session_state.get("mapping_ok", False) and st.session_state.get("preproc_flags", {}).get("rep_cochran", True):
-        mapped_df = st.session_state.get("mapped_df")
+    # Define mapped_df at this scope so ALL outlier UI sections can access it
+    mapped_df = st.session_state.get("mapped_df")
+    
+    if st.session_state.get("mapping_ok", False) and st.session_state.get("preproc_flags", {}).get("rep_cochran", True) and mapped_df is not None:
         if mapped_df is not None and not mapped_df.empty:
             # Detect replicate-level outliers
             detected_outliers = _detect_replicate_outliers(mapped_df.copy())
             
+            # Initialize selection storage if not present
+            if "rep_outlier_selections" not in st.session_state:
+                st.session_state["rep_outlier_selections"] = {}
+            
             if detected_outliers:
-                st.markdown("---")
-                st.subheader("🔍 Replicate-level Outliers Detected (QI 8a)")
-                st.markdown(
-                    "The following Subject×Sample pairs have **unusually high replicate variance** "
-                    "(Cochran's test). Choose how to handle each:"
-                )
+                # In AUTO mode, set all selections to "remove_all" without showing UI
+                if st.session_state.get("outlier_mode", "auto") == "auto":
+                    for outlier in detected_outliers:
+                        key = (outlier["Subject"], outlier["Sample"])
+                        st.session_state["rep_outlier_selections"][key] = "remove_all"
+                else:
+                    # MANUAL mode: show UI for user selection
+                    st.markdown("---")
+                    st.markdown("#### 🔍 Replicate-level Outliers (Cochran QI 8a)")
+                    st.caption(f"Found **{len(detected_outliers)}** sample(s) with unusually high replicate variance. Choose an action for each:")
                 
-                # Initialize selection storage if not present
-                if "rep_outlier_selections" not in st.session_state:
-                    st.session_state["rep_outlier_selections"] = {}
-                
-                for i, outlier in enumerate(detected_outliers):
-                    subj = outlier["Subject"]
-                    samp = outlier["Sample"]
-                    variance = outlier["variance"]
-                    reps = outlier["replicates"]
-                    
-                    with st.expander(
-                        f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
-                        f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
-                        expanded=True
-                    ):
-                        # Show replicate values as a small table
-                        rep_df = pd.DataFrame(reps)
-                        st.dataframe(rep_df, use_container_width=True, hide_index=True)
-                        
-                        # Build options
-                        options = ["🗑️ Remove entire sample (default)"]
-                        for r in reps:
-                            options.append(
-                                f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})"
-                            )
-                        options.append("⏩ Keep all (ignore outlier)")
-                        
-                        # Get stored selection or default
+                    for i, outlier in enumerate(detected_outliers):
+                        subj = outlier["Subject"]
+                        samp = outlier["Sample"]
+                        variance = outlier["variance"]
+                        reps = outlier["replicates"]
                         key = (subj, samp)
-                        stored_idx = 0
-                        if key in st.session_state.get("rep_outlier_selections", {}):
-                            stored_action = st.session_state["rep_outlier_selections"][key]
-                            if stored_action == "remove_all":
+                        
+                        # Compact card-style container
+                        with st.container():
+                            col1, col2 = st.columns([1, 2])
+                            
+                            with col1:
+                                st.markdown(f"**Subject {subj}, Sample {samp}**")
+                                st.caption(f"s² = {variance:.4f} | G = {outlier['G']:.3f}")
+                                # Compact replicate display
+                                rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                                st.code(rep_str, language=None)
+                            
+                            with col2:
+                                # Build compact options
+                                options = ["🗑️ Remove sample"]
+                                for r in reps:
+                                    options.append(f"✅ Keep R{r['Replicate']}")
+                                options.append("⏩ Ignore")
+                                
+                                # Get stored selection or default
                                 stored_idx = 0
-                            elif stored_action == "ignore":
-                                stored_idx = len(options) - 1
-                            elif stored_action.startswith("keep_rep_"):
-                                rep_id = stored_action.replace("keep_rep_", "")
-                                for j, r in enumerate(reps):
-                                    if str(r["Replicate"]) == rep_id:
-                                        stored_idx = j + 1
-                                        break
+                                if key in st.session_state.get("rep_outlier_selections", {}):
+                                    stored_action = st.session_state["rep_outlier_selections"][key]
+                                    if stored_action == "remove_all":
+                                        stored_idx = 0
+                                    elif stored_action == "ignore":
+                                        stored_idx = len(options) - 1
+                                    elif stored_action.startswith("keep_rep_"):
+                                        rep_id = stored_action.replace("keep_rep_", "")
+                                        for j, r in enumerate(reps):
+                                            if str(r["Replicate"]) == rep_id:
+                                                stored_idx = j + 1
+                                                break
+                                
+                                selected = st.radio(
+                                    "Action:",
+                                    options,
+                                    index=stored_idx,
+                                    key=f"rep_outlier_action_{i}_{subj}_{samp}",
+                                    horizontal=True,
+                                    label_visibility="collapsed"
+                                )
+                                
+                                # Map selection to action string
+                                if selected.startswith("🗑️"):
+                                    action = "remove_all"
+                                elif selected.startswith("⏩"):
+                                    action = "ignore"
+                                else:
+                                    # Extract replicate number from selection
+                                    for r in reps:
+                                        if f"R{r['Replicate']}" in selected:
+                                            action = f"keep_rep_{r['Replicate']}"
+                                            break
+                                
+                                st.session_state["rep_outlier_selections"][key] = action
                         
-                        selected = st.radio(
-                            "Action:",
-                            options,
-                            index=stored_idx,
-                            key=f"rep_outlier_action_{i}_{subj}_{samp}",
-                            horizontal=False
-                        )
-                        
-                        # Map selection to action string
-                        if selected.startswith("🗑️"):
-                            action = "remove_all"
-                        elif selected.startswith("⏩"):
-                            action = "ignore"
-                        else:
-                            # Extract replicate number from selection
-                            for r in reps:
-                                if f"Replicate {r['Replicate']}" in selected:
-                                    action = f"keep_rep_{r['Replicate']}"
-                                    break
-                        
-                        st.session_state["rep_outlier_selections"][key] = action
-                
-                st.markdown("---")
+                        if i < len(detected_outliers) - 1:
+                            st.markdown("<hr style='margin: 0.5rem 0; opacity: 0.3;'>", unsafe_allow_html=True)
             else:
                 # Clear any stale selections if no outliers detected
                 st.session_state["rep_outlier_selections"] = {}
@@ -2808,6 +3318,564 @@ if user_df is not None:
     else:
         # Clear selections if Cochran is disabled
         st.session_state["rep_outlier_selections"] = {}
+
+    # ─────────────────────────────────────────────────────────────
+    # Bartlett Outlier Detection & Selection UI (QI 8a - Bartlett)
+    # ─────────────────────────────────────────────────────────────
+    if preproc_flags.get("rep_bartlett", False) and st.session_state.get("mapping_ok", False) and mapped_df is not None:
+        # Initialize session state for Bartlett selections
+        if "rep_bartlett_selections" not in st.session_state:
+            st.session_state["rep_bartlett_selections"] = {}
+        
+        # Apply Cochran exclusions first (Bartlett should run on Cochran-cleaned data)
+        df_for_bartlett = mapped_df.copy()
+        cochran_selections = st.session_state.get("rep_outlier_selections", {})
+        for (subj, samp), action in cochran_selections.items():
+            if action == "remove_all":
+                df_for_bartlett = df_for_bartlett[~((df_for_bartlett["Subject"] == subj) & (df_for_bartlett["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                rep_to_keep = action.replace("keep_rep_", "")
+                try:
+                    rep_to_keep = int(float(rep_to_keep))
+                except ValueError:
+                    pass
+                mask = (df_for_bartlett["Subject"] == subj) & (df_for_bartlett["Sample"] == samp)
+                keep_mask = mask & (df_for_bartlett["Replicate"] == rep_to_keep)
+                df_for_bartlett = df_for_bartlett[~mask | keep_mask]
+            # "ignore" action: keep data as-is
+        
+        # Detect Bartlett outliers on Cochran-cleaned data
+        bartlett_outliers = _detect_bartlett_outliers(df_for_bartlett)
+        
+        if bartlett_outliers:
+            if st.session_state.get("outlier_mode", "auto") == "auto":
+                for outlier in bartlett_outliers:
+                    key = (outlier["Subject"], outlier["Sample"])
+                    st.session_state["rep_bartlett_selections"][key] = "remove_all"
+            else:
+                st.markdown("---")
+                st.markdown("#### 🔬 Bartlett Iterative Variance Outlier Exclusion (QI 8a)")
+                st.info(
+                    f"**Iterative Process:** Found **{len(bartlett_outliers)}** sample(s) to review. "
+                    "Bartlett's test removes the **highest-variance sample**, re-tests, and repeats until homogeneity is achieved. "
+                    "The order below reflects the removal sequence."
+                )
+            
+                for i, outlier in enumerate(bartlett_outliers):
+                    subj = outlier["Subject"]
+                    samp = outlier["Sample"]
+                    variance = outlier["variance"]
+                    reps = outlier["replicates"]
+                    key = (subj, samp)
+                    
+                    # Step indicator with visual hierarchy
+                    step_num = i + 1
+                    with st.container():
+                    # Step header
+                        st.markdown(
+                            f"<div style='background: linear-gradient(90deg, #667eea22 0%, transparent 100%); "
+                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #667eea; margin-bottom: 0.5rem;'>"
+                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                            unsafe_allow_html=True
+                        )
+                        
+                        col1, col2 = st.columns([1, 2])
+                        
+                        with col1:
+                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                            st.caption(f"**Bartlett p:** {outlier['p']:.4f}")
+                            # Compact replicate display
+                            rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                            st.code(rep_str, language=None)
+                        
+                        with col2:
+                            # Build compact options with step-aware labels
+                            options = [f"🗑️ Remove (proceed to Step {step_num + 1})"]
+                            for r in reps:
+                                options.append(f"✅ Keep only R{r['Replicate']}")
+                            options.append("⏩ Ignore (accept heterogeneity)")
+                            
+                            # Get stored selection or default
+                            stored_idx = 0
+                            if key in st.session_state.get("rep_bartlett_selections", {}):
+                                stored_action = st.session_state["rep_bartlett_selections"][key]
+                                if stored_action == "remove_all":
+                                    stored_idx = 0
+                                elif stored_action == "ignore":
+                                    stored_idx = len(options) - 1
+                                elif stored_action.startswith("keep_rep_"):
+                                    rep_id = stored_action.replace("keep_rep_", "")
+                                    for j, r in enumerate(reps):
+                                        if str(r["Replicate"]) == rep_id:
+                                            stored_idx = j + 1
+                                            break
+                            
+                            selected = st.radio(
+                                "Action:",
+                                options,
+                                index=stored_idx,
+                                key=f"bartlett_outlier_action_{i}_{subj}_{samp}",
+                                horizontal=True,
+                                label_visibility="collapsed"
+                            )
+                            
+                            # Map selection to action string
+                            if selected.startswith("🗑️"):
+                                action = "remove_all"
+                            elif selected.startswith("⏩"):
+                                action = "ignore"
+                            else:
+                                # Extract replicate number from selection
+                                for r in reps:
+                                    if f"R{r['Replicate']}" in selected:
+                                        action = f"keep_rep_{r['Replicate']}"
+                                        break
+                            
+                            st.session_state["rep_bartlett_selections"][key] = action
+                
+                # Arrow connector between steps
+                if i < len(bartlett_outliers) - 1:
+                    st.markdown(
+                        "<div style='text-align: center; color: #667eea; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>",
+                        unsafe_allow_html=True
+                    )
+            
+                # Final state indicator (outside loop)
+                st.markdown(
+                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                    "✅ <b>Homogeneity Target</b> — After processing all steps above, variances should be homogeneous.</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+                    # Clear any stale selections if no outliers detected
+            st.session_state["rep_bartlett_selections"] = {}
+    else:
+        # Clear selections if Bartlett exclusion is disabled
+        st.session_state["rep_bartlett_selections"] = {}
+
+
+    # ─────────────────────────────────────────────────────────────
+    # QI 8b – Sample‑level Cochran Outlier Detection & Selection UI
+    # ─────────────────────────────────────────────────────────────
+    if preproc_flags.get("samp_cochran", True) and st.session_state.get("mapping_ok", False) and user_df is not None:
+        if "samp_cochran_selections" not in st.session_state:
+            st.session_state["samp_cochran_selections"] = {}
+            
+        # 1. Clean data based on previous steps (Replicate Cochran & Bartlett)
+        df_clean_sc = mapped_df.copy()
+        
+        # Apply Rep Cochran
+        rc_sels = st.session_state.get("rep_outlier_selections", {})
+        for (subj, samp), action in rc_sels.items():
+            if action == "remove_all":
+                df_clean_sc = df_clean_sc[~((df_clean_sc["Subject"] == subj) & (df_clean_sc["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_sc["Subject"] == subj) & (df_clean_sc["Sample"] == samp)
+                    keep_mask = mask & (df_clean_sc["Replicate"] == rep_to_keep)
+                    df_clean_sc = df_clean_sc[~mask | keep_mask]
+                except: pass
+
+        # Apply Rep Bartlett
+        rb_sels = st.session_state.get("rep_bartlett_selections", {})
+        for (subj, samp), action in rb_sels.items():
+            if action == "remove_all":
+                df_clean_sc = df_clean_sc[~((df_clean_sc["Subject"] == subj) & (df_clean_sc["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_sc["Subject"] == subj) & (df_clean_sc["Sample"] == samp)
+                    keep_mask = mask & (df_clean_sc["Replicate"] == rep_to_keep)
+                    df_clean_sc = df_clean_sc[~mask | keep_mask]
+                except: pass
+        
+        # 2. Detect Sample Outliers
+        samp_outliers = _detect_sample_cochran_outliers(df_clean_sc)
+        
+        if samp_outliers:
+            if st.session_state.get("outlier_mode", "auto") == "auto":
+                for out in samp_outliers:
+                    st.session_state["samp_cochran_selections"][(out["Subject"], out["Sample"])] = "remove"
+            else:
+                st.markdown("---")
+                st.markdown("#### 🔬 Sample-level Outliers (Cochran QI 8b)")
+                st.info(f"**Iterative Process:** Found **{len(samp_outliers)}** outlier sample(s).")
+                
+                for i, outlier in enumerate(samp_outliers):
+                    subj = outlier["Subject"]
+                    samp = outlier["Sample"]
+                    variance = outlier["variance"]
+                    key = (subj, samp)
+                    step_num = i + 1
+                    
+                    with st.container():
+                        st.markdown(
+                            f"<div style='background: linear-gradient(90deg, #8b5cf622 0%, transparent 100%); "
+                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #8b5cf6; margin-bottom: 0.5rem;'>"
+                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                            unsafe_allow_html=True
+                        )
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                            st.caption(f"**G:** {outlier['G']:.3f} (Crit: {outlier['G_crit']:.3f})")
+                        with col2:
+                            options = ["🗑️ Remove Sample", "⏩ Ignore (Stop)"]
+                            stored_idx = 0
+                            if key in st.session_state.get("samp_cochran_selections", {}):
+                                if st.session_state["samp_cochran_selections"][key] == "ignore":
+                                    stored_idx = 1
+                            
+                            selected = st.radio("Action:", options, index=stored_idx, 
+                                              key=f"samp_coch_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+                            
+                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                            st.session_state["samp_cochran_selections"][key] = action
+                    
+                    if i < len(samp_outliers) - 1:
+                        st.markdown("<div style='text-align: center; color: #8b5cf6; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                st.markdown("---")
+        else:
+             st.session_state["samp_cochran_selections"] = {}
+    else:
+        st.session_state["samp_cochran_selections"] = {}
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # QI 10 Within-subject Bartlett Outlier Detection & Selection UI
+    # ─────────────────────────────────────────────────────────────
+    if preproc_flags.get("wp_bartlett_exclusion", False) and st.session_state.get("mapping_ok", False) and user_df is not None:
+        # Initialize session state for QI 10 selections
+        if "wp_bartlett_selections" not in st.session_state:
+            st.session_state["wp_bartlett_selections"] = {}
+        
+        # Apply previous exclusions before detecting QI 10 outliers
+        # QI 10 should run on data after Cochran and QI 8a Bartlett are applied
+        df_for_wp_bartlett = mapped_df.copy()
+        
+        # Apply Cochran selections
+        cochran_sels = st.session_state.get("rep_outlier_selections", {})
+        for (subj, samp), action in cochran_sels.items():
+            if action == "remove_all":
+                df_for_wp_bartlett = df_for_wp_bartlett[~((df_for_wp_bartlett["Subject"] == subj) & (df_for_wp_bartlett["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                rep_to_keep = action.replace("keep_rep_", "")
+                try:
+                    rep_to_keep = int(float(rep_to_keep))
+                except ValueError:
+                    pass
+                mask = (df_for_wp_bartlett["Subject"] == subj) & (df_for_wp_bartlett["Sample"] == samp)
+                keep_mask = mask & (df_for_wp_bartlett["Replicate"] == rep_to_keep)
+                df_for_wp_bartlett = df_for_wp_bartlett[~mask | keep_mask]
+        
+        # Apply QI 8a Bartlett selections
+        bartlett_sels = st.session_state.get("rep_bartlett_selections", {})
+        for (subj, samp), action in bartlett_sels.items():
+            if action == "remove_all":
+                df_for_wp_bartlett = df_for_wp_bartlett[~((df_for_wp_bartlett["Subject"] == subj) & (df_for_wp_bartlett["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                rep_to_keep = action.replace("keep_rep_", "")
+                try:
+                    rep_to_keep = int(float(rep_to_keep))
+                except ValueError:
+                    pass
+                mask = (df_for_wp_bartlett["Subject"] == subj) & (df_for_wp_bartlett["Sample"] == samp)
+                keep_mask = mask & (df_for_wp_bartlett["Replicate"] == rep_to_keep)
+                df_for_wp_bartlett = df_for_wp_bartlett[~mask | keep_mask]
+                
+        # Apply Sample Cochran selections
+        sc_sels = st.session_state.get("samp_cochran_selections", {})
+        for (subj, samp), action in sc_sels.items():
+             if action == "remove":
+                df_for_wp_bartlett = df_for_wp_bartlett[~((df_for_wp_bartlett["Subject"] == subj) & (df_for_wp_bartlett["Sample"] == samp))]
+        
+        # Detect QI 10 outliers
+        wp_bartlett_outliers = _detect_wp_bartlett_outliers(df_for_wp_bartlett)
+        
+        if wp_bartlett_outliers:
+            # In AUTO mode, set all selections to "remove" without showing UI
+            if st.session_state.get("outlier_mode", "auto") == "auto":
+                for outlier in wp_bartlett_outliers:
+                    st.session_state["wp_bartlett_selections"][outlier["Subject"]] = "remove"
+            else:
+                # MANUAL mode: show UI for user selection
+                st.markdown("---")
+                st.markdown("#### 🧬 QI 10: Within-Subject Variance Outliers (Bartlett)")
+                st.info(
+                    f"**Iterative Process:** Found **{len(wp_bartlett_outliers)}** subject(s) causing within-subject variance heterogeneity. "
+                    "The order below reflects the removal sequence."
+                )
+            
+                for i, outlier in enumerate(wp_bartlett_outliers):
+                    subj = outlier["Subject"]
+                    variance = outlier["within_subject_variance"]
+                    sample_means = outlier["sample_means"]
+                    step_num = i + 1
+                    
+                    with st.container():
+                                st.markdown(
+                                    f"<div style='background: linear-gradient(90deg, #f59e0b22 0%, transparent 100%); "
+                                    f"padding: 0.3rem 0.5rem; border-left: 3px solid #f59e0b; margin-bottom: 0.5rem;'>"
+                                    f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                    unsafe_allow_html=True
+                                )
+                                
+                                col1, col2 = st.columns([1, 2])
+                                
+                                with col1:
+                                    st.caption(f"**Within-subject s²:** {variance:.4f}")
+                                    st.caption(f"**Bartlett p:** {outlier['p']:.4f}")
+                                    # Show sample means
+                                    means_str = " · ".join([f"S{sm['Sample']}={sm['Result']:.2f}" for sm in sample_means])
+                                    st.code(means_str, language=None)
+                                
+                                with col2:
+                                    options = [f"🗑️ Remove subject (proceed to Step {step_num + 1})", "⏩ Ignore (accept heterogeneity)"]
+                                    
+                                    stored_idx = 0
+                                    if subj in st.session_state.get("wp_bartlett_selections", {}):
+                                        stored_action = st.session_state["wp_bartlett_selections"][subj]
+                                        if stored_action == "remove":
+                                            stored_idx = 0
+                                        elif stored_action == "ignore":
+                                            stored_idx = 1
+                                    
+                                    selected = st.radio(
+                                        "Action:",
+                                        options,
+                                        index=stored_idx,
+                                        key=f"wp_bartlett_action_{i}_{subj}",
+                                        horizontal=True,
+                                        label_visibility="collapsed"
+                                    )
+                                    
+                                    if selected.startswith("🗑️"):
+                                        action = "remove"
+                                    else:
+                                        action = "ignore"
+                                    
+                                    st.session_state["wp_bartlett_selections"][subj] = action
+                            
+                    if i < len(wp_bartlett_outliers) - 1:
+                        st.markdown(
+                            "<div style='text-align: center; color: #f59e0b; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>",
+                            unsafe_allow_html=True
+                        )
+                
+                st.markdown(
+                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                    "✅ <b>Homogeneity Target</b> — After processing all steps, within-subject variances should be homogeneous.</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+                    st.session_state["wp_bartlett_selections"] = {}
+ 
+    # ─────────────────────────────────────────────────────────────
+    # QI 8c – Reed Between-Subject Outlier Detection & Selection UI
+    # ─────────────────────────────────────────────────────────────
+    if preproc_flags.get("reed", True) and st.session_state.get("mapping_ok", False) and user_df is not None:
+        if "reed_selections" not in st.session_state:
+            st.session_state["reed_selections"] = {}
+            
+        # 1. Clean data based on ALL previous steps (8a -> 8b -> 10)
+        df_clean_reed = mapped_df.copy()
+        
+        # Apply Rep Cochran
+        rc_sels = st.session_state.get("rep_outlier_selections", {})
+        for (subj, samp), action in rc_sels.items():
+            if action == "remove_all":
+                df_clean_reed = df_clean_reed[~((df_clean_reed["Subject"] == subj) & (df_clean_reed["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_reed["Subject"] == subj) & (df_clean_reed["Sample"] == samp)
+                    keep_mask = mask & (df_clean_reed["Replicate"] == rep_to_keep)
+                    df_clean_reed = df_clean_reed[~mask | keep_mask]
+                except: pass
+
+        # Apply Rep Bartlett
+        rb_sels = st.session_state.get("rep_bartlett_selections", {})
+        for (subj, samp), action in rb_sels.items():
+            if action == "remove_all":
+                df_clean_reed = df_clean_reed[~((df_clean_reed["Subject"] == subj) & (df_clean_reed["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_reed["Subject"] == subj) & (df_clean_reed["Sample"] == samp)
+                    keep_mask = mask & (df_clean_reed["Replicate"] == rep_to_keep)
+                    df_clean_reed = df_clean_reed[~mask | keep_mask]
+                except: pass
+                
+        # Apply Sample Cochran
+        sc_sels = st.session_state.get("samp_cochran_selections", {})
+        for (subj, samp), action in sc_sels.items():
+             if action == "remove":
+                df_clean_reed = df_clean_reed[~((df_clean_reed["Subject"] == subj) & (df_clean_reed["Sample"] == samp))]
+
+        # Apply QI 10 Bartlett (New!)
+        wb_sels = st.session_state.get("wp_bartlett_selections", {})
+        for subj, action in wb_sels.items():
+            if action == "remove":
+                df_clean_reed = df_clean_reed[df_clean_reed["Subject"] != subj]
+
+        # 2. Detect Reed Outliers
+        reed_outliers = _detect_reed_outliers(df_clean_reed)
+        
+        if reed_outliers:
+            if st.session_state.get("outlier_mode", "auto") == "auto":
+                for out in reed_outliers:
+                    st.session_state["reed_selections"][out["Subject"]] = "remove"
+            else:
+                st.markdown("---")
+                st.markdown("#### 🔬 Reed Outliers (QI 8c)")
+                st.info(f"**Between-subject check:** Found **{len(reed_outliers)}** outlier subject(s) with extreme means.")
+                
+                for i, outlier in enumerate(reed_outliers):
+                    subj = outlier["Subject"]
+                    mean_val = outlier["mean"]
+                    reason = outlier["reason"]
+                    step_num = i + 1
+                    
+                    with st.container():
+                        st.markdown(
+                            f"<div style='background: linear-gradient(90deg, #ef444422 0%, transparent 100%); "
+                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #ef4444; margin-bottom: 0.5rem;'>"
+                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                            unsafe_allow_html=True
+                        )
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            st.caption(f"**Mean:** {mean_val:.4f}")
+                            st.caption(f"**Reason:** {reason}")
+                        with col2:
+                            options = ["🗑️ Remove Subject", "⏩ Ignore (Stop)"]
+                            stored_idx = 0
+                            if subj in st.session_state.get("reed_selections", {}):
+                                if st.session_state["reed_selections"][subj] == "ignore":
+                                    stored_idx = 1
+                            
+                            selected = st.radio("Action:", options, index=stored_idx, 
+                                              key=f"reed_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+                            
+                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                            st.session_state["reed_selections"][subj] = action
+                    
+                    if i < len(reed_outliers) - 1:
+                        st.markdown("<div style='text-align: center; color: #ef4444; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                st.markdown("---")
+        else:
+            if st.session_state.get("outlier_mode", "auto") != "auto":
+                st.markdown("#### 🔬 Reed Outliers (QI 8c)")
+                st.success("✅ No outliers detected (or masked by prior exclusion steps).")
+                st.markdown("---")
+            st.session_state["reed_selections"] = {}
+
+    # ─────────────────────────────────────────────────────────────
+    # QI 7 – Steady-State Drift Detection & Selection UI
+    # ─────────────────────────────────────────────────────────────
+    if preproc_flags.get("drift", True) and st.session_state.get("mapping_ok", False) and user_df is not None:
+        if "drift_selections" not in st.session_state:
+            st.session_state["drift_selections"] = {}
+            
+        # 1. Clean data based on ALL previous steps
+        # Cascade: Rep Cochran -> Rep Bartlett -> Samp Cochran -> WP Bartlett -> Reed
+        df_clean_drift = mapped_df.copy()
+        
+        # Apply Rep Cochran
+        rc_sels = st.session_state.get("rep_outlier_selections", {})
+        for (subj, samp), action in rc_sels.items():
+            if action == "remove_all":
+                df_clean_drift = df_clean_drift[~((df_clean_drift["Subject"] == subj) & (df_clean_drift["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_drift["Subject"] == subj) & (df_clean_drift["Sample"] == samp)
+                    keep_mask = mask & (df_clean_drift["Replicate"] == rep_to_keep)
+                    df_clean_drift = df_clean_drift[~mask | keep_mask]
+                except: pass
+
+        # Apply Rep Bartlett
+        rb_sels = st.session_state.get("rep_bartlett_selections", {})
+        for (subj, samp), action in rb_sels.items():
+            if action == "remove_all":
+                df_clean_drift = df_clean_drift[~((df_clean_drift["Subject"] == subj) & (df_clean_drift["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                try:
+                    rep_to_keep = int(float(action.replace("keep_rep_", "")))
+                    mask = (df_clean_drift["Subject"] == subj) & (df_clean_drift["Sample"] == samp)
+                    keep_mask = mask & (df_clean_drift["Replicate"] == rep_to_keep)
+                    df_clean_drift = df_clean_drift[~mask | keep_mask]
+                except: pass
+                
+        # Apply Sample Cochran
+        sc_sels = st.session_state.get("samp_cochran_selections", {})
+        for (subj, samp), action in sc_sels.items():
+             if action == "remove":
+                df_clean_drift = df_clean_drift[~((df_clean_drift["Subject"] == subj) & (df_clean_drift["Sample"] == samp))]
+
+        # Apply QI 10 Bartlett
+        wb_sels = st.session_state.get("wp_bartlett_selections", {})
+        for subj, action in wb_sels.items():
+            if action == "remove":
+                df_clean_drift = df_clean_drift[df_clean_drift["Subject"] != subj]
+
+        # Apply Reed
+        reed_sels = st.session_state.get("reed_selections", {})
+        for subj, action in reed_sels.items():
+            if action == "remove":
+                df_clean_drift = df_clean_drift[df_clean_drift["Subject"] != subj]
+
+        # 2. Detect Drift Outliers
+        drift_outliers = _detect_drift_outliers(df_clean_drift)
+        
+        if drift_outliers:
+            if st.session_state.get("outlier_mode", "auto") == "auto":
+                for out in drift_outliers:
+                    st.session_state["drift_selections"][out["Subject"]] = "remove"
+            else:
+                st.markdown("---")
+                st.markdown("#### 📉 Steady-State Drift (QI 7)")
+                st.info(f"**Trend check:** Found **{len(drift_outliers)}** subject(s) with significant drift over time.")
+                
+                for i, outlier in enumerate(drift_outliers):
+                    subj = outlier["Subject"]
+                    slope = outlier["slope"]
+                    p_val = outlier["p"]
+                    step_num = i + 1
+                    
+                    with st.container():
+                        st.markdown(
+                            f"<div style='background: linear-gradient(90deg, #8b5cf622 0%, transparent 100%); "
+                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #8b5cf6; margin-bottom: 0.5rem;'>"
+                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                            unsafe_allow_html=True
+                        )
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            st.caption(f"**Slope:** {slope:.4f}")
+                            st.caption(f"**p-value:** {p_val:.4f}")
+                        with col2:
+                            options = ["🗑️ Remove Subject", "⏩ Ignore (Accept Trend)"]
+                            stored_idx = 0
+                            if subj in st.session_state.get("drift_selections", {}):
+                                if st.session_state["drift_selections"][subj] == "ignore":
+                                    stored_idx = 1
+                            
+                            selected = st.radio("Action:", options, index=stored_idx, 
+                                              key=f"drift_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+                            
+                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                            st.session_state["drift_selections"][subj] = action
+                    
+                    if i < len(drift_outliers) - 1:
+                        st.markdown("<div style='text-align: center; color: #8b5cf6; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                st.markdown("---")
+        else:
+             st.session_state["drift_selections"] = {}
+    else:
+        st.session_state["drift_selections"] = {}
 
     # ─────────────────────────────────────────────────────────────
     # Gender-based calculations UI
@@ -2870,16 +3938,34 @@ if user_df is not None:
     # ─────────────────────────────────────────────────────────────
     # Gender-specific replicate outlier detection UI
     # ─────────────────────────────────────────────────────────────
-    if (gender_based and gender_settings_ok and 
-        st.session_state.get("mapping_ok", False) and 
+    
+    # Helper function to apply Cochran/Bartlett selections to a dataframe
+    # Defined at this scope so all gender-based outlier sections can use it
+    def _apply_cochran_selections(df, selections):
+        for (subj, samp), action in selections.items():
+            if action == "remove_all" or action == "remove":
+                df = df[~((df["Subject"] == subj) & (df["Sample"] == samp))]
+            elif action.startswith("keep_rep_"):
+                rep_to_keep = action.replace("keep_rep_", "")
+                try:
+                    rep_to_keep = int(float(rep_to_keep))
+                except ValueError:
+                    pass
+                mask = (df["Subject"] == subj) & (df["Sample"] == samp)
+                keep_mask = mask & (df["Replicate"] == rep_to_keep)
+                df = df[~mask | keep_mask]
+        return df
+    
+    if (gender_based and gender_settings_ok and
+        st.session_state.get("mapping_ok", False) and
         st.session_state.get("preproc_flags", {}).get("rep_cochran", True)):
-        
+
         mapped_df = st.session_state.get("mapped_df")
         if mapped_df is not None and not mapped_df.empty:
             # Build gender-split datasets
             df_with_gender = mapped_df.copy()
             mode = st.session_state.get("gender_mode", "Single gender column")
-            
+
             if mode == "Single gender column":
                 gcol = st.session_state.get("gender_col")
                 mv = st.session_state.get("male_value")
@@ -2891,110 +3977,835 @@ if user_df is not None:
                 fcol = st.session_state.get("female_col")
                 if mcol and fcol and mcol in user_df.columns and fcol in user_df.columns:
                     df_with_gender["Gender"] = _derive_gender_two_indicators(user_df, mcol, fcol)
-            
+
             if "Gender" in df_with_gender.columns:
                 male_df = df_with_gender[df_with_gender["Gender"] == "Male"].drop(columns=["Gender"]).copy()
                 female_df = df_with_gender[df_with_gender["Gender"] == "Female"].drop(columns=["Gender"]).copy()
-                
-                # Initialize gender-specific selection storage
+
+                # Initialize ALL gender-specific selection storage
                 if "rep_outlier_selections_male" not in st.session_state:
                     st.session_state["rep_outlier_selections_male"] = {}
                 if "rep_outlier_selections_female" not in st.session_state:
                     st.session_state["rep_outlier_selections_female"] = {}
-                
-                # Detect outliers for Male
-                if not male_df.empty:
-                    male_outliers = _detect_replicate_outliers(male_df)
-                    if male_outliers:
-                        st.markdown("---")
-                        st.subheader("🔍 Male: Replicate-level Outliers (QI 8a)")
-                        for i, outlier in enumerate(male_outliers):
-                            subj, samp = outlier["Subject"], outlier["Sample"]
-                            variance, reps = outlier["variance"], outlier["replicates"]
-                            with st.expander(
-                                f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
-                                f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
-                                expanded=True
-                            ):
-                                st.dataframe(pd.DataFrame(reps), use_container_width=True, hide_index=True)
-                                options = ["🗑️ Remove entire sample (default)"]
-                                for r in reps:
-                                    options.append(f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})")
-                                options.append("⏩ Keep all (ignore outlier)")
-                                
-                                key = (subj, samp)
-                                stored_idx = 0
-                                if key in st.session_state.get("rep_outlier_selections_male", {}):
-                                    stored_action = st.session_state["rep_outlier_selections_male"][key]
-                                    if stored_action == "remove_all": stored_idx = 0
-                                    elif stored_action == "ignore": stored_idx = len(options) - 1
-                                    elif stored_action.startswith("keep_rep_"):
-                                        for j, r in enumerate(reps):
-                                            if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
-                                                stored_idx = j + 1; break
-                                
-                                selected = st.radio("Action:", options, index=stored_idx,
-                                    key=f"male_outlier_{i}_{subj}_{samp}", horizontal=False)
-                                
-                                if selected.startswith("🗑️"): action = "remove_all"
-                                elif selected.startswith("⏩"): action = "ignore"
-                                else:
-                                    for r in reps:
-                                        if f"Replicate {r['Replicate']}" in selected:
-                                            action = f"keep_rep_{r['Replicate']}"; break
-                                st.session_state["rep_outlier_selections_male"][key] = action
-                    else:
-                        st.session_state["rep_outlier_selections_male"] = {}
-                
-                # Detect outliers for Female
+                if "rep_bartlett_selections_male" not in st.session_state:
+                    st.session_state["rep_bartlett_selections_male"] = {}
+                if "rep_bartlett_selections_female" not in st.session_state:
+                    st.session_state["rep_bartlett_selections_female"] = {}
+                if "samp_cochran_selections_male" not in st.session_state:
+                    st.session_state["samp_cochran_selections_male"] = {}
+                if "samp_cochran_selections_female" not in st.session_state:
+                    st.session_state["samp_cochran_selections_female"] = {}
+                if "wp_bartlett_selections_male" not in st.session_state:
+                    st.session_state["wp_bartlett_selections_male"] = {}
+                if "wp_bartlett_selections_female" not in st.session_state:
+                    st.session_state["wp_bartlett_selections_female"] = {}
+                if "reed_selections_male" not in st.session_state:
+                    st.session_state["reed_selections_male"] = {}
+                if "reed_selections_female" not in st.session_state:
+                    st.session_state["reed_selections_female"] = {}
+                if "drift_selections_male" not in st.session_state:
+                    st.session_state["drift_selections_male"] = {}
+                if "drift_selections_female" not in st.session_state:
+                    st.session_state["drift_selections_female"] = {}
+
+                # ═══════════════════════════════════════════════════════════════
+                # FEMALE - All Outlier Steps
+                # ═══════════════════════════════════════════════════════════════
                 if not female_df.empty:
+                    if st.session_state.get("outlier_mode", "auto") != "auto":
+                        st.markdown("---")
+                        st.markdown("## 👩 Female Outlier Analysis")
+                        st.markdown("---")
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Replicate-level Cochran (QI 8a)
+                    # ─────────────────────────────────────────────────────────────
                     female_outliers = _detect_replicate_outliers(female_df)
                     if female_outliers:
-                        st.markdown("---")
-                        st.subheader("🔍 Female: Replicate-level Outliers (QI 8a)")
-                        for i, outlier in enumerate(female_outliers):
-                            subj, samp = outlier["Subject"], outlier["Sample"]
-                            variance, reps = outlier["variance"], outlier["replicates"]
-                            with st.expander(
-                                f"**Subject {subj}, Sample {samp}** — s² = {variance:.4f} "
-                                f"(G = {outlier['G']:.3f} > Gcrit = {outlier['G_crit']:.3f})",
-                                expanded=True
-                            ):
-                                st.dataframe(pd.DataFrame(reps), use_container_width=True, hide_index=True)
-                                options = ["🗑️ Remove entire sample (default)"]
-                                for r in reps:
-                                    options.append(f"✅ Keep only Replicate {r['Replicate']} ({r['Result']:.2f})")
-                                options.append("⏩ Keep all (ignore outlier)")
-                                
+                        if st.session_state.get("outlier_mode", "auto") == "auto":
+                            for outlier in female_outliers:
+                                key = (outlier["Subject"], outlier["Sample"])
+                                st.session_state["rep_outlier_selections_female"][key] = "remove_all"
+                        else:
+                            st.markdown("#### 🔍 Female: Replicate-level Outliers (Cochran QI 8a)")
+                            st.caption(f"Found **{len(female_outliers)}** sample(s) with high variance.")
+
+                            for i, outlier in enumerate(female_outliers):
+                                subj, samp = outlier["Subject"], outlier["Sample"]
+                                variance, reps = outlier["variance"], outlier["replicates"]
                                 key = (subj, samp)
-                                stored_idx = 0
-                                if key in st.session_state.get("rep_outlier_selections_female", {}):
-                                    stored_action = st.session_state["rep_outlier_selections_female"][key]
-                                    if stored_action == "remove_all": stored_idx = 0
-                                    elif stored_action == "ignore": stored_idx = len(options) - 1
-                                    elif stored_action.startswith("keep_rep_"):
-                                        for j, r in enumerate(reps):
-                                            if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
-                                                stored_idx = j + 1; break
-                                
-                                selected = st.radio("Action:", options, index=stored_idx,
-                                    key=f"female_outlier_{i}_{subj}_{samp}", horizontal=False)
-                                
-                                if selected.startswith("🗑️"): action = "remove_all"
-                                elif selected.startswith("⏩"): action = "ignore"
-                                else:
-                                    for r in reps:
-                                        if f"Replicate {r['Replicate']}" in selected:
-                                            action = f"keep_rep_{r['Replicate']}"; break
-                                st.session_state["rep_outlier_selections_female"][key] = action
+
+                                with st.container():
+                                    col1, col2 = st.columns([1, 2])
+
+                                    with col1:
+                                        st.markdown(f"**Subject {subj}, Sample {samp}**")
+                                        st.caption(f"s² = {variance:.4f} | G = {outlier['G']:.3f}")
+                                        rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                                        st.code(rep_str, language=None)
+
+                                    with col2:
+                                        options = ["🗑️ Remove sample"]
+                                        for r in reps:
+                                            options.append(f"✅ Keep R{r['Replicate']}")
+                                        options.append("⏩ Ignore")
+
+                                        stored_idx = 0
+                                        if key in st.session_state.get("rep_outlier_selections_female", {}):
+                                            stored_action = st.session_state["rep_outlier_selections_female"][key]
+                                            if stored_action == "remove_all": stored_idx = 0
+                                            elif stored_action == "ignore": stored_idx = len(options) - 1
+                                            elif stored_action.startswith("keep_rep_"):
+                                                for j, r in enumerate(reps):
+                                                    if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                        stored_idx = j + 1; break
+
+                                        selected = st.radio("Action:", options, index=stored_idx,
+                                            key=f"female_outlier_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                        if selected.startswith("🗑️"): action = "remove_all"
+                                        elif selected.startswith("⏩"): action = "ignore"
+                                        else:
+                                            for r in reps:
+                                                if f"R{r['Replicate']}" in selected:
+                                                    action = f"keep_rep_{r['Replicate']}"; break
+                                        st.session_state["rep_outlier_selections_female"][key] = action
+
+                                if i < len(female_outliers) - 1:
+                                    st.markdown("<hr style='margin: 0.5rem 0; opacity: 0.3;'>", unsafe_allow_html=True)
+                            st.markdown("---")
                     else:
                         st.session_state["rep_outlier_selections_female"] = {}
-                
-                st.markdown("---")
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Replicate-level Bartlett (QI 8a)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("rep_bartlett_exclusion", False):
+                        female_df_bartlett = _apply_cochran_selections(female_df.copy(), st.session_state.get("rep_outlier_selections_female", {}))
+                        female_bartlett_outliers = _detect_bartlett_outliers(female_df_bartlett)
+
+                        if female_bartlett_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for outlier in female_bartlett_outliers:
+                                    key = (outlier["Subject"], outlier["Sample"])
+                                    st.session_state["rep_bartlett_selections_female"][key] = "remove_all"
+                            else:
+                                st.markdown("#### 🔬 Female: Bartlett Iterative Outliers (QI 8a)")
+                                st.info(f"**After Cochran cleanup:** Found **{len(female_bartlett_outliers)}** sample(s) for iterative Bartlett exclusion.")
+
+                                for i, outlier in enumerate(female_bartlett_outliers):
+                                    subj, samp = outlier["Subject"], outlier["Sample"]
+                                    variance, reps = outlier["variance"], outlier["replicates"]
+                                    key = (subj, samp)
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #ec489922 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #ec4899; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+
+                                        with col1:
+                                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                                            rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                                            st.code(rep_str, language=None)
+
+                                        with col2:
+                                            options = [f"🗑️ Remove (proceed to Step {step_num + 1})"]
+                                            for r in reps:
+                                                options.append(f"✅ Keep only R{r['Replicate']}")
+                                            options.append("⏩ Ignore (accept heterogeneity)")
+
+                                            stored_idx = 0
+                                            if key in st.session_state.get("rep_bartlett_selections_female", {}):
+                                                stored_action = st.session_state["rep_bartlett_selections_female"][key]
+                                                if stored_action == "remove_all": stored_idx = 0
+                                                elif stored_action == "ignore": stored_idx = len(options) - 1
+                                                elif stored_action.startswith("keep_rep_"):
+                                                    for j, r in enumerate(reps):
+                                                        if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                            stored_idx = j + 1; break
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                key=f"female_bartlett_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                            if selected.startswith("🗑️"): action = "remove_all"
+                                            elif selected.startswith("⏩"): action = "ignore"
+                                            else:
+                                                for r in reps:
+                                                    if f"R{r['Replicate']}" in selected:
+                                                        action = f"keep_rep_{r['Replicate']}"; break
+                                            st.session_state["rep_bartlett_selections_female"][key] = action
+
+                                    if i < len(female_bartlett_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #ec4899; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown(
+                                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                                    "✅ <b>Homogeneity Target</b> — After processing all steps above, variances should be homogeneous.</div>",
+                                    unsafe_allow_html=True
+                                )
+                                st.markdown("---")
+                        else:
+                            st.session_state["rep_bartlett_selections_female"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Sample-level Cochran (QI 8b)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("samp_cochran", True):
+                        female_df_sc = female_df.copy()
+                        female_df_sc = _apply_cochran_selections(female_df_sc, st.session_state.get("rep_outlier_selections_female", {}))
+                        female_df_sc = _apply_cochran_selections(female_df_sc, st.session_state.get("rep_bartlett_selections_female", {}))
+
+                        female_samp_outliers = _detect_sample_cochran_outliers(female_df_sc)
+
+                        if female_samp_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in female_samp_outliers:
+                                    st.session_state["samp_cochran_selections_female"][(out["Subject"], out["Sample"])] = "remove"
+                            else:
+                                st.markdown("#### 🔬 Female: Sample-level Outliers (Cochran QI 8b)")
+                                st.info(f"**Iterative Process:** Found **{len(female_samp_outliers)}** outlier sample(s).")
+
+                                for i, outlier in enumerate(female_samp_outliers):
+                                    subj = outlier["Subject"]
+                                    samp = outlier["Sample"]
+                                    variance = outlier["variance"]
+                                    key = (subj, samp)
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #d946ef22 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #d946ef; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                                            st.caption(f"**G:** {outlier['G']:.3f} (Crit: {outlier['G_crit']:.3f})")
+                                        with col2:
+                                            options = ["🗑️ Remove Sample", "⏩ Ignore (Stop)"]
+                                            stored_idx = 0
+                                            if key in st.session_state.get("samp_cochran_selections_female", {}):
+                                                if st.session_state["samp_cochran_selections_female"][key] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"female_samp_coch_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["samp_cochran_selections_female"][key] = action
+
+                                    if i < len(female_samp_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #d946ef; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            st.session_state["samp_cochran_selections_female"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Within-Subject Bartlett (QI 10)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("wp_bartlett_exclusion", False):
+                        female_df_wb = female_df.copy()
+                        female_df_wb = _apply_cochran_selections(female_df_wb, st.session_state.get("rep_outlier_selections_female", {}))
+                        female_df_wb = _apply_cochran_selections(female_df_wb, st.session_state.get("rep_bartlett_selections_female", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_wb = female_df_wb[~((female_df_wb["Subject"] == subj) & (female_df_wb["Sample"] == samp))]
+
+                        female_wb_outliers = _detect_wp_bartlett_outliers(female_df_wb)
+
+                        if female_wb_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in female_wb_outliers:
+                                    st.session_state["wp_bartlett_selections_female"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 🧬 Female: Within-Subject Variance Outliers (QI 10)")
+                                st.info(f"**Iterative Process:** Found **{len(female_wb_outliers)}** subject(s) with heterogeneous variance.")
+
+                                for i, outlier in enumerate(female_wb_outliers):
+                                    subj = outlier["Subject"]
+                                    variance = outlier["within_subject_variance"]
+                                    sample_means = outlier["sample_means"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #ec489922 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #ec4899; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Within-subject s²:** {variance:.4f}")
+                                            st.caption(f"**Bartlett p:** {outlier['p']:.4f}")
+                                            means_str = " · ".join([f"S{sm['Sample']}={sm['Result']:.2f}" for sm in sample_means])
+                                            st.code(means_str, language=None)
+
+                                        with col2:
+                                            options = [f"🗑️ Remove subject (proceed to Step {step_num + 1})", "⏩ Ignore (accept heterogeneity)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("wp_bartlett_selections_female", {}):
+                                                stored_action = st.session_state["wp_bartlett_selections_female"][subj]
+                                                if stored_action == "remove": stored_idx = 0
+                                                elif stored_action == "ignore": stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"female_wp_bart_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["wp_bartlett_selections_female"][subj] = action
+
+                                    if i < len(female_wb_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #ec4899; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+
+                                st.markdown(
+                                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                                    "✅ <b>Homogeneity Target</b> — After processing all steps, within-subject variances should be homogeneous.</div>",
+                                    unsafe_allow_html=True
+                                )
+                                st.markdown("---")
+                        else:
+                            st.session_state["wp_bartlett_selections_female"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Reed (QI 8c)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("reed", True):
+                        female_df_reed = female_df.copy()
+                        female_df_reed = _apply_cochran_selections(female_df_reed, st.session_state.get("rep_outlier_selections_female", {}))
+                        female_df_reed = _apply_cochran_selections(female_df_reed, st.session_state.get("rep_bartlett_selections_female", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_reed = female_df_reed[~((female_df_reed["Subject"] == subj) & (female_df_reed["Sample"] == samp))]
+                        for subj, action in st.session_state.get("wp_bartlett_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_reed = female_df_reed[female_df_reed["Subject"] != subj]
+
+                        female_reed_outliers = _detect_reed_outliers(female_df_reed)
+
+                        if female_reed_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in female_reed_outliers:
+                                    st.session_state["reed_selections_female"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 🔬 Female: Reed Outliers (QI 8c)")
+                                st.info(f"**Between-subject check:** Found **{len(female_reed_outliers)}** outlier subject(s).")
+
+                                for i, outlier in enumerate(female_reed_outliers):
+                                    subj = outlier["Subject"]
+                                    mean_val = outlier["mean"]
+                                    reason = outlier["reason"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #ef444422 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #ef4444; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Mean:** {mean_val:.4f}")
+                                            st.caption(f"**Reason:** {reason}")
+                                        with col2:
+                                            options = ["🗑️ Remove Subject", "⏩ Ignore (Stop)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("reed_selections_female", {}):
+                                                if st.session_state["reed_selections_female"][subj] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"female_reed_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["reed_selections_female"][subj] = action
+
+                                    if i < len(female_reed_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #ef4444; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            if st.session_state.get("outlier_mode", "auto") != "auto":
+                                st.markdown("#### 🔬 Female: Reed Outliers (QI 8c)")
+                                st.success("✅ No outliers detected (or masked by prior exclusion steps).")
+                                st.markdown("---")
+                            st.session_state["reed_selections_female"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Female: Steady-State Drift (QI 7)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("drift", True):
+                        female_df_drift = female_df.copy()
+                        female_df_drift = _apply_cochran_selections(female_df_drift, st.session_state.get("rep_outlier_selections_female", {}))
+                        female_df_drift = _apply_cochran_selections(female_df_drift, st.session_state.get("rep_bartlett_selections_female", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_drift = female_df_drift[~((female_df_drift["Subject"] == subj) & (female_df_drift["Sample"] == samp))]
+                        for subj, action in st.session_state.get("wp_bartlett_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_drift = female_df_drift[female_df_drift["Subject"] != subj]
+                        for subj, action in st.session_state.get("reed_selections_female", {}).items():
+                            if action == "remove":
+                                female_df_drift = female_df_drift[female_df_drift["Subject"] != subj]
+
+                        female_drift_outliers = _detect_drift_outliers(female_df_drift)
+
+                        if female_drift_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in female_drift_outliers:
+                                    st.session_state["drift_selections_female"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 📉 Female: Steady-State Drift (QI 7)")
+                                st.info(f"**Trend check:** Found **{len(female_drift_outliers)}** subject(s) with significant drift.")
+
+                                for i, outlier in enumerate(female_drift_outliers):
+                                    subj = outlier["Subject"]
+                                    slope = outlier["slope"]
+                                    p_val = outlier["p"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #d946ef22 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #d946ef; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Slope:** {slope:.4f}")
+                                            st.caption(f"**p-value:** {p_val:.4f}")
+                                        with col2:
+                                            options = ["🗑️ Remove Subject", "⏩ Ignore (Accept Trend)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("drift_selections_female", {}):
+                                                if st.session_state["drift_selections_female"][subj] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"female_drift_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["drift_selections_female"][subj] = action
+
+                                    if i < len(female_drift_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #d946ef; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            st.session_state["drift_selections_female"] = {}
+
+                # ═══════════════════════════════════════════════════════════════
+                # MALE - All Outlier Steps
+                # ═══════════════════════════════════════════════════════════════
+                if not male_df.empty:
+                    if st.session_state.get("outlier_mode", "auto") != "auto":
+                        st.markdown("---")
+                        st.markdown("## 👨 Male Outlier Analysis")
+                        st.markdown("---")
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Replicate-level Cochran (QI 8a)
+                    # ─────────────────────────────────────────────────────────────
+                    male_outliers = _detect_replicate_outliers(male_df)
+                    if male_outliers:
+                        if st.session_state.get("outlier_mode", "auto") == "auto":
+                            for outlier in male_outliers:
+                                key = (outlier["Subject"], outlier["Sample"])
+                                st.session_state["rep_outlier_selections_male"][key] = "remove_all"
+                        else:
+                            st.markdown("#### 🔍 Male: Replicate-level Outliers (Cochran QI 8a)")
+                            st.caption(f"Found **{len(male_outliers)}** sample(s) with high variance.")
+
+                            for i, outlier in enumerate(male_outliers):
+                                subj, samp = outlier["Subject"], outlier["Sample"]
+                                variance, reps = outlier["variance"], outlier["replicates"]
+                                key = (subj, samp)
+
+                                with st.container():
+                                    col1, col2 = st.columns([1, 2])
+
+                                    with col1:
+                                        st.markdown(f"**Subject {subj}, Sample {samp}**")
+                                        st.caption(f"s² = {variance:.4f} | G = {outlier['G']:.3f}")
+                                        rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                                        st.code(rep_str, language=None)
+
+                                    with col2:
+                                        options = ["🗑️ Remove sample"]
+                                        for r in reps:
+                                            options.append(f"✅ Keep R{r['Replicate']}")
+                                        options.append("⏩ Ignore")
+
+                                        stored_idx = 0
+                                        if key in st.session_state.get("rep_outlier_selections_male", {}):
+                                            stored_action = st.session_state["rep_outlier_selections_male"][key]
+                                            if stored_action == "remove_all": stored_idx = 0
+                                            elif stored_action == "ignore": stored_idx = len(options) - 1
+                                            elif stored_action.startswith("keep_rep_"):
+                                                for j, r in enumerate(reps):
+                                                    if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                        stored_idx = j + 1; break
+
+                                        selected = st.radio("Action:", options, index=stored_idx,
+                                            key=f"male_outlier_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                        if selected.startswith("🗑️"): action = "remove_all"
+                                        elif selected.startswith("⏩"): action = "ignore"
+                                        else:
+                                            for r in reps:
+                                                if f"R{r['Replicate']}" in selected:
+                                                    action = f"keep_rep_{r['Replicate']}"; break
+                                        st.session_state["rep_outlier_selections_male"][key] = action
+
+                                if i < len(male_outliers) - 1:
+                                    st.markdown("<hr style='margin: 0.5rem 0; opacity: 0.3;'>", unsafe_allow_html=True)
+                            st.markdown("---")
+                    else:
+                        st.session_state["rep_outlier_selections_male"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Replicate-level Bartlett (QI 8a)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("rep_bartlett_exclusion", False):
+                        male_df_bartlett = _apply_cochran_selections(male_df.copy(), st.session_state.get("rep_outlier_selections_male", {}))
+                        male_bartlett_outliers = _detect_bartlett_outliers(male_df_bartlett)
+
+                        if male_bartlett_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for outlier in male_bartlett_outliers:
+                                    key = (outlier["Subject"], outlier["Sample"])
+                                    st.session_state["rep_bartlett_selections_male"][key] = "remove_all"
+                            else:
+                                st.markdown("#### 🔬 Male: Bartlett Iterative Outliers (QI 8a)")
+                                st.info(f"**After Cochran cleanup:** Found **{len(male_bartlett_outliers)}** sample(s) for iterative Bartlett exclusion.")
+
+                                for i, outlier in enumerate(male_bartlett_outliers):
+                                    subj, samp = outlier["Subject"], outlier["Sample"]
+                                    variance, reps = outlier["variance"], outlier["replicates"]
+                                    key = (subj, samp)
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #3b82f622 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #3b82f6; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+
+                                        with col1:
+                                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                                            rep_str = " · ".join([f"R{r['Replicate']}={r['Result']:.2f}" for r in reps])
+                                            st.code(rep_str, language=None)
+
+                                        with col2:
+                                            options = [f"🗑️ Remove (proceed to Step {step_num + 1})"]
+                                            for r in reps:
+                                                options.append(f"✅ Keep only R{r['Replicate']}")
+                                            options.append("⏩ Ignore (accept heterogeneity)")
+
+                                            stored_idx = 0
+                                            if key in st.session_state.get("rep_bartlett_selections_male", {}):
+                                                stored_action = st.session_state["rep_bartlett_selections_male"][key]
+                                                if stored_action == "remove_all": stored_idx = 0
+                                                elif stored_action == "ignore": stored_idx = len(options) - 1
+                                                elif stored_action.startswith("keep_rep_"):
+                                                    for j, r in enumerate(reps):
+                                                        if str(r["Replicate"]) == stored_action.replace("keep_rep_", ""):
+                                                            stored_idx = j + 1; break
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                key=f"male_bartlett_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                            if selected.startswith("🗑️"): action = "remove_all"
+                                            elif selected.startswith("⏩"): action = "ignore"
+                                            else:
+                                                for r in reps:
+                                                    if f"R{r['Replicate']}" in selected:
+                                                        action = f"keep_rep_{r['Replicate']}"; break
+                                            st.session_state["rep_bartlett_selections_male"][key] = action
+
+                                    if i < len(male_bartlett_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #3b82f6; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown(
+                                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                                    "✅ <b>Homogeneity Target</b> — After processing all steps above, variances should be homogeneous.</div>",
+                                    unsafe_allow_html=True
+                                )
+                                st.markdown("---")
+                        else:
+                            st.session_state["rep_bartlett_selections_male"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Sample-level Cochran (QI 8b)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("samp_cochran", True):
+                        male_df_sc = male_df.copy()
+                        male_df_sc = _apply_cochran_selections(male_df_sc, st.session_state.get("rep_outlier_selections_male", {}))
+                        male_df_sc = _apply_cochran_selections(male_df_sc, st.session_state.get("rep_bartlett_selections_male", {}))
+
+                        male_samp_outliers = _detect_sample_cochran_outliers(male_df_sc)
+
+                        if male_samp_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in male_samp_outliers:
+                                    st.session_state["samp_cochran_selections_male"][(out["Subject"], out["Sample"])] = "remove"
+                            else:
+                                st.markdown("#### 🔬 Male: Sample-level Outliers (Cochran QI 8b)")
+                                st.info(f"**Iterative Process:** Found **{len(male_samp_outliers)}** outlier sample(s).")
+
+                                for i, outlier in enumerate(male_samp_outliers):
+                                    subj = outlier["Subject"]
+                                    samp = outlier["Sample"]
+                                    variance = outlier["variance"]
+                                    key = (subj, samp)
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #8b5cf622 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #8b5cf6; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}, Sample {samp}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Variance:** s² = {variance:.4f}")
+                                            st.caption(f"**G:** {outlier['G']:.3f} (Crit: {outlier['G_crit']:.3f})")
+                                        with col2:
+                                            options = ["🗑️ Remove Sample", "⏩ Ignore (Stop)"]
+                                            stored_idx = 0
+                                            if key in st.session_state.get("samp_cochran_selections_male", {}):
+                                                if st.session_state["samp_cochran_selections_male"][key] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"male_samp_coch_{i}_{subj}_{samp}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["samp_cochran_selections_male"][key] = action
+
+                                    if i < len(male_samp_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #8b5cf6; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            st.session_state["samp_cochran_selections_male"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Within-Subject Bartlett (QI 10)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("wp_bartlett_exclusion", False):
+                        male_df_wb = male_df.copy()
+                        male_df_wb = _apply_cochran_selections(male_df_wb, st.session_state.get("rep_outlier_selections_male", {}))
+                        male_df_wb = _apply_cochran_selections(male_df_wb, st.session_state.get("rep_bartlett_selections_male", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_wb = male_df_wb[~((male_df_wb["Subject"] == subj) & (male_df_wb["Sample"] == samp))]
+
+                        male_wb_outliers = _detect_wp_bartlett_outliers(male_df_wb)
+
+                        if male_wb_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in male_wb_outliers:
+                                    st.session_state["wp_bartlett_selections_male"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 🧬 Male: Within-Subject Variance Outliers (QI 10)")
+                                st.info(f"**Iterative Process:** Found **{len(male_wb_outliers)}** subject(s) with heterogeneous variance.")
+
+                                for i, outlier in enumerate(male_wb_outliers):
+                                    subj = outlier["Subject"]
+                                    variance = outlier["within_subject_variance"]
+                                    sample_means = outlier["sample_means"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #f59e0b22 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #f59e0b; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Within-subject s²:** {variance:.4f}")
+                                            st.caption(f"**Bartlett p:** {outlier['p']:.4f}")
+                                            means_str = " · ".join([f"S{sm['Sample']}={sm['Result']:.2f}" for sm in sample_means])
+                                            st.code(means_str, language=None)
+
+                                        with col2:
+                                            options = [f"🗑️ Remove subject (proceed to Step {step_num + 1})", "⏩ Ignore (accept heterogeneity)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("wp_bartlett_selections_male", {}):
+                                                stored_action = st.session_state["wp_bartlett_selections_male"][subj]
+                                                if stored_action == "remove": stored_idx = 0
+                                                elif stored_action == "ignore": stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"male_wp_bart_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["wp_bartlett_selections_male"][subj] = action
+
+                                    if i < len(male_wb_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #f59e0b; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+
+                                st.markdown(
+                                    "<div style='background: #22c55e22; padding: 0.5rem; border-left: 3px solid #22c55e; margin-top: 0.5rem;'>"
+                                    "✅ <b>Homogeneity Target</b> — After processing all steps, within-subject variances should be homogeneous.</div>",
+                                    unsafe_allow_html=True
+                                )
+                                st.markdown("---")
+                        else:
+                            st.session_state["wp_bartlett_selections_male"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Reed (QI 8c)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("reed", True):
+                        male_df_reed = male_df.copy()
+                        male_df_reed = _apply_cochran_selections(male_df_reed, st.session_state.get("rep_outlier_selections_male", {}))
+                        male_df_reed = _apply_cochran_selections(male_df_reed, st.session_state.get("rep_bartlett_selections_male", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_reed = male_df_reed[~((male_df_reed["Subject"] == subj) & (male_df_reed["Sample"] == samp))]
+                        for subj, action in st.session_state.get("wp_bartlett_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_reed = male_df_reed[male_df_reed["Subject"] != subj]
+
+                        male_reed_outliers = _detect_reed_outliers(male_df_reed)
+
+                        if male_reed_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in male_reed_outliers:
+                                    st.session_state["reed_selections_male"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 🔬 Male: Reed Outliers (QI 8c)")
+                                st.info(f"**Between-subject check:** Found **{len(male_reed_outliers)}** outlier subject(s).")
+
+                                for i, outlier in enumerate(male_reed_outliers):
+                                    subj = outlier["Subject"]
+                                    mean_val = outlier["mean"]
+                                    reason = outlier["reason"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #ef444422 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #ef4444; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Mean:** {mean_val:.4f}")
+                                            st.caption(f"**Reason:** {reason}")
+                                        with col2:
+                                            options = ["🗑️ Remove Subject", "⏩ Ignore (Stop)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("reed_selections_male", {}):
+                                                if st.session_state["reed_selections_male"][subj] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"male_reed_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["reed_selections_male"][subj] = action
+
+                                    if i < len(male_reed_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #ef4444; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            if st.session_state.get("outlier_mode", "auto") != "auto":
+                                st.markdown("#### 🔬 Male: Reed Outliers (QI 8c)")
+                                st.success("✅ No outliers detected (or masked by prior exclusion steps).")
+                                st.markdown("---")
+                            st.session_state["reed_selections_male"] = {}
+
+                    # ─────────────────────────────────────────────────────────────
+                    # Male: Steady-State Drift (QI 7)
+                    # ─────────────────────────────────────────────────────────────
+                    if preproc_flags.get("drift", True):
+                        male_df_drift = male_df.copy()
+                        male_df_drift = _apply_cochran_selections(male_df_drift, st.session_state.get("rep_outlier_selections_male", {}))
+                        male_df_drift = _apply_cochran_selections(male_df_drift, st.session_state.get("rep_bartlett_selections_male", {}))
+                        for (subj, samp), action in st.session_state.get("samp_cochran_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_drift = male_df_drift[~((male_df_drift["Subject"] == subj) & (male_df_drift["Sample"] == samp))]
+                        for subj, action in st.session_state.get("wp_bartlett_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_drift = male_df_drift[male_df_drift["Subject"] != subj]
+                        for subj, action in st.session_state.get("reed_selections_male", {}).items():
+                            if action == "remove":
+                                male_df_drift = male_df_drift[male_df_drift["Subject"] != subj]
+
+                        male_drift_outliers = _detect_drift_outliers(male_df_drift)
+
+                        if male_drift_outliers:
+                            if st.session_state.get("outlier_mode", "auto") == "auto":
+                                for out in male_drift_outliers:
+                                    st.session_state["drift_selections_male"][out["Subject"]] = "remove"
+                            else:
+                                st.markdown("#### 📉 Male: Steady-State Drift (QI 7)")
+                                st.info(f"**Trend check:** Found **{len(male_drift_outliers)}** subject(s) with significant drift.")
+
+                                for i, outlier in enumerate(male_drift_outliers):
+                                    subj = outlier["Subject"]
+                                    slope = outlier["slope"]
+                                    p_val = outlier["p"]
+                                    step_num = i + 1
+
+                                    with st.container():
+                                        st.markdown(
+                                            f"<div style='background: linear-gradient(90deg, #8b5cf622 0%, transparent 100%); "
+                                            f"padding: 0.3rem 0.5rem; border-left: 3px solid #8b5cf6; margin-bottom: 0.5rem;'>"
+                                            f"<b>Step {step_num}</b> — Subject {subj}</div>",
+                                            unsafe_allow_html=True
+                                        )
+                                        col1, col2 = st.columns([1, 2])
+                                        with col1:
+                                            st.caption(f"**Slope:** {slope:.4f}")
+                                            st.caption(f"**p-value:** {p_val:.4f}")
+                                        with col2:
+                                            options = ["🗑️ Remove Subject", "⏩ Ignore (Accept Trend)"]
+                                            stored_idx = 0
+                                            if subj in st.session_state.get("drift_selections_male", {}):
+                                                if st.session_state["drift_selections_male"][subj] == "ignore":
+                                                    stored_idx = 1
+
+                                            selected = st.radio("Action:", options, index=stored_idx,
+                                                              key=f"male_drift_{i}_{subj}", horizontal=True, label_visibility="collapsed")
+
+                                            action = "remove" if selected.startswith("🗑️") else "ignore"
+                                            st.session_state["drift_selections_male"][subj] = action
+
+                                    if i < len(male_drift_outliers) - 1:
+                                        st.markdown("<div style='text-align: center; color: #8b5cf6; font-size: 1.5rem; margin: 0.3rem 0;'>↓</div>", unsafe_allow_html=True)
+                                st.markdown("---")
+                        else:
+                            st.session_state["drift_selections_male"] = {}
     else:
         # Clear gender-specific selections if not applicable
         st.session_state["rep_outlier_selections_male"] = {}
-        st.session_state["rep_outlier_selections_female"] = {}    # NEW: disable Calculate until mapping_ok
+        st.session_state["rep_outlier_selections_female"] = {}
+        st.session_state["rep_bartlett_selections_male"] = {}
+        st.session_state["rep_bartlett_selections_female"] = {}
+        st.session_state["samp_cochran_selections_male"] = {}
+        st.session_state["samp_cochran_selections_female"] = {}
+        st.session_state["wp_bartlett_selections_male"] = {}
+        st.session_state["wp_bartlett_selections_female"] = {}
+        st.session_state["reed_selections_male"] = {}
+        st.session_state["reed_selections_female"] = {}
+        st.session_state["drift_selections_male"] = {}
+        st.session_state["drift_selections_female"] = {}
+
     calc_disabled = (not st.session_state.get("mapping_ok", False)) or (
         st.session_state.get("gender_based", False) and (not st.session_state.get("gender_settings_ok", True))
     )
@@ -3017,6 +4828,11 @@ if user_df is not None:
                     use_cv_anova=st.session_state.get("use_cv_anova", False),
                     enforce_balance=st.session_state.get("enforce_balance", True),
                     rep_outlier_selections=st.session_state.get("rep_outlier_selections", {}),
+                    rep_bartlett_selections=st.session_state.get("rep_bartlett_selections", {}),
+                    samp_cochran_selections=st.session_state.get("samp_cochran_selections", {}),
+                    wp_bartlett_selections=st.session_state.get("wp_bartlett_selections", {}),
+                    reed_selections=st.session_state.get("reed_selections", {}),
+                    drift_selections=st.session_state.get("drift_selections", {}),
                 )
                 # ─────────────────────────────────────────────────────────────
                 # --- Gender-split calculations (run the same pipeline per gender) ---
@@ -3066,6 +4882,11 @@ if user_df is not None:
                                 use_cv_anova=use_cv_anova_flag,
                                 enforce_balance=enforce_balance_flag,
                                 rep_outlier_selections=st.session_state.get("rep_outlier_selections_male", {}),
+                                rep_bartlett_selections=st.session_state.get("rep_bartlett_selections_male", {}),
+                                samp_cochran_selections=st.session_state.get("samp_cochran_selections_male", {}),
+                                wp_bartlett_selections=st.session_state.get("wp_bartlett_selections_male", {}),
+                                reed_selections=st.session_state.get("reed_selections_male", {}),
+                                drift_selections=st.session_state.get("drift_selections_male", {}),
                             )
                             male_df_final = res_male.clean_df
                         except Exception as e:
@@ -3077,6 +4898,11 @@ if user_df is not None:
                                 use_cv_anova=use_cv_anova_flag,
                                 enforce_balance=enforce_balance_flag,
                                 rep_outlier_selections=st.session_state.get("rep_outlier_selections_female", {}),
+                                rep_bartlett_selections=st.session_state.get("rep_bartlett_selections_female", {}),
+                                samp_cochran_selections=st.session_state.get("samp_cochran_selections_female", {}),
+                                wp_bartlett_selections=st.session_state.get("wp_bartlett_selections_female", {}),
+                                reed_selections=st.session_state.get("reed_selections_female", {}),
+                                drift_selections=st.session_state.get("drift_selections_female", {}),
                             )
                             female_df_final = res_female.clean_df
                         except Exception as e:
