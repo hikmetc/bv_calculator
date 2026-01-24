@@ -367,16 +367,17 @@ def _strip_ghost_index(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 def _validate_and_build_mapping(df: pd.DataFrame,
                                 subj_sel: str, samp_sel: str, repl_sel: str, res_sel: str
-) -> tuple[pd.DataFrame | None, list[str], list[str]]:
-    """Return (mapped_df, errors, warnings). Ensures 4 distinct columns and numeric 'Result'."""
+) -> tuple[pd.DataFrame | None, list[str], list[str], list]:
+    """Return (mapped_df, errors, warnings, dropped_indices). Ensures 4 distinct columns and numeric 'Result'."""
     errors, warnings = [], []
+    dropped_indices = []  # Track indices of dropped rows for gender-specific reporting
 
     # Distinct columns?
     chosen = [subj_sel, samp_sel, repl_sel, res_sel]
     if len(set(chosen)) != 4:
         errors.append("Please select **four different columns** (no duplicates).")
 
-    # Build mapped view early so we can check types
+    # Build mapped view early so we can check types - preserve original index
     mapped = df.rename(columns={
         subj_sel: "Subject",
         samp_sel: "Sample",
@@ -384,11 +385,28 @@ def _validate_and_build_mapping(df: pd.DataFrame,
         res_sel:  "Result",
     })[["Subject", "Sample", "Replicate", "Result"]].copy()
 
+    # Check for missing/empty Result values BEFORE numeric conversion
+    # Count rows where Result is NaN, None, or empty string
+    original_result = mapped["Result"]
+    missing_mask = original_result.isna() | (original_result.astype(str).str.strip() == "")
+    n_missing = missing_mask.sum()
+
     # Coerce numeric columns
     mapped["Result"] = pd.to_numeric(mapped["Result"], errors="coerce")
-    n_bad_res = mapped["Result"].isna().sum()
-    if n_bad_res:
-        errors.append(f"'Result / value' must be numeric → {n_bad_res} row(s) are non-numeric.")
+    n_na_after = mapped["Result"].isna().sum()
+
+    # Non-numeric = values that became NaN after conversion but weren't originally missing
+    n_non_numeric = n_na_after - n_missing
+
+    if n_non_numeric > 0:
+        errors.append(f"'Result / value' must be numeric → {n_non_numeric} row(s) contain non-numeric text.")
+
+    # Handle missing values: drop them with a warning instead of error
+    if n_missing > 0:
+        warnings.append(f"Dropped {n_missing} row(s) with missing/empty Result values.")
+        # Store indices of dropped rows before dropping
+        dropped_indices = mapped[mapped["Result"].isna()].index.tolist()
+        mapped = mapped.dropna(subset=["Result"])
 
     # Sample & Replicate should be numeric (visit/timepoint & within-sample repeat index)
     mapped["Sample"] = pd.to_numeric(mapped["Sample"], errors="coerce")
@@ -404,7 +422,7 @@ def _validate_and_build_mapping(df: pd.DataFrame,
     if mapped.dropna().empty:
         errors.append("All mapped values are empty after type checks.")
 
-    return (None, errors, warnings) if errors else (mapped, errors, warnings)
+    return (None, errors, warnings, dropped_indices) if errors else (mapped, errors, warnings, dropped_indices)
 
 
 def _render_log_html(lines: list[str], alpha: float = 0.05) -> str:
@@ -1277,6 +1295,7 @@ def _preprocess_bv_dataframe(
         wp_bartlett_selections: dict | None = None,  # user selections for QI 10 within-subject Bartlett
         reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
         drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
+        mapping_warnings: list[str] | None = None,   # warnings from data mapping (e.g., dropped rows)
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
@@ -1284,6 +1303,11 @@ def _preprocess_bv_dataframe(
     a detailed chronological log (list of strings).
     """
     log: list[str] = []
+
+    # Add mapping warnings at the start of the log (e.g., dropped rows with missing values)
+    if mapping_warnings:
+        for warn in mapping_warnings:
+            log.append(f"Data mapping: {warn}")
     df = df_in.copy()
     transformed = False
 
@@ -2192,6 +2216,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
                  wp_bartlett_selections: dict | None = None,  # user selections for QI 10 within-subject Bartlett
                  reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
                  drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
+                 mapping_warnings: list[str] | None = None,   # warnings from data mapping (e.g., dropped rows)
 ) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
@@ -2235,12 +2260,12 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
     S0 = df.groupby("Subject")["Sample"].nunique().mode().iat[0]
     R0 = df.groupby(["Subject", "Sample"])["Replicate"].nunique().mode().iat[0]
     # -------------------------------------------------------------------------
-    # 3.1  apply Braga–Panteghini outlier/normality pipeline  
+    # 3.1  apply Braga–Panteghini outlier/normality pipeline
     try:
         df, pp_log = _preprocess_bv_dataframe(
-            df, 
-            alpha=alpha, 
-            enforce_balance=enforce_balance, 
+            df,
+            alpha=alpha,
+            enforce_balance=enforce_balance,
             flags=st.session_state.get("preproc_flags"),
             rep_outlier_selections=rep_outlier_selections,
             rep_bartlett_selections=rep_bartlett_selections,
@@ -2248,6 +2273,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             wp_bartlett_selections=wp_bartlett_selections,
             reed_selections=reed_selections,
             drift_selections=drift_selections,
+            mapping_warnings=mapping_warnings or [],
         )
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
@@ -3167,7 +3193,7 @@ if user_df is not None:
 
 
         if confirmed:
-            mapped_df, errs, warns = _validate_and_build_mapping(
+            mapped_df, errs, warns, dropped_indices = _validate_and_build_mapping(
                 user_df, subj_sel, samp_sel, repl_sel, res_sel
             )
             if errs:
@@ -3175,12 +3201,16 @@ if user_df is not None:
                     st.error(e)
                 st.session_state["mapping_ok"] = False
                 st.session_state["mapped_df"] = None
+                st.session_state["mapping_warnings"] = []
+                st.session_state["dropped_row_indices"] = []
             else:
                 if warns:
                     for w in warns:
                         st.warning(w)
                 st.session_state["mapping_ok"] = True
                 st.session_state["mapped_df"] = mapped_df
+                st.session_state["mapping_warnings"] = warns  # Store for preprocessing log
+                st.session_state["dropped_row_indices"] = dropped_indices  # Store dropped indices for gender split
                 st.session_state["result_unit"] = (result_unit or "").strip()   # NEW
                 st.session_state["measurand_name"] = (measurand_name or "").strip()   # NEW
                 st.session_state["mapped_source_cols"] = list(user_df.columns)  # NEW
@@ -4833,6 +4863,7 @@ if user_df is not None:
                     wp_bartlett_selections=st.session_state.get("wp_bartlett_selections", {}),
                     reed_selections=st.session_state.get("reed_selections", {}),
                     drift_selections=st.session_state.get("drift_selections", {}),
+                    mapping_warnings=st.session_state.get("mapping_warnings", []),
                 )
                 # ─────────────────────────────────────────────────────────────
                 # --- Gender-split calculations (run the same pipeline per gender) ---
@@ -4876,6 +4907,51 @@ if user_df is not None:
                         male_input = df_gender[df_gender["Gender"] == "Male"].drop(columns=["Gender"])
                         female_input = df_gender[df_gender["Gender"] == "Female"].drop(columns=["Gender"])
 
+                        # Calculate gender-specific mapping warnings for dropped rows
+                        dropped_indices = st.session_state.get("dropped_row_indices", [])
+                        male_warnings = []
+                        female_warnings = []
+                        if dropped_indices:
+                            # Determine gender for each dropped row from original user_df
+                            mode = st.session_state.get("gender_mode", "Single gender column")
+                            n_male_dropped = 0
+                            n_female_dropped = 0
+                            n_unknown_dropped = 0
+
+                            for idx in dropped_indices:
+                                if idx in user_df.index:
+                                    if mode == "Single gender column":
+                                        gcol = st.session_state.get("gender_col")
+                                        mv = st.session_state.get("male_value")
+                                        fv = st.session_state.get("female_value")
+                                        if gcol and gcol in user_df.columns:
+                                            val = user_df.loc[idx, gcol]
+                                            if str(val) == str(mv):
+                                                n_male_dropped += 1
+                                            elif str(val) == str(fv):
+                                                n_female_dropped += 1
+                                            else:
+                                                n_unknown_dropped += 1
+                                    else:
+                                        mcol = st.session_state.get("male_col")
+                                        fcol = st.session_state.get("female_col")
+                                        if mcol and fcol and mcol in user_df.columns and fcol in user_df.columns:
+                                            m_val = user_df.loc[idx, mcol]
+                                            f_val = user_df.loc[idx, fcol]
+                                            is_m = pd.notna(m_val) and str(m_val).strip() not in ("", "0", "nan")
+                                            is_f = pd.notna(f_val) and str(f_val).strip() not in ("", "0", "nan")
+                                            if is_m and not is_f:
+                                                n_male_dropped += 1
+                                            elif is_f and not is_m:
+                                                n_female_dropped += 1
+                                            else:
+                                                n_unknown_dropped += 1
+
+                            if n_male_dropped > 0:
+                                male_warnings.append(f"Dropped {n_male_dropped} row(s) with missing/empty Result values.")
+                            if n_female_dropped > 0:
+                                female_warnings.append(f"Dropped {n_female_dropped} row(s) with missing/empty Result values.")
+
                         try:
                             res_male = calculate_bv(
                                 male_input,
@@ -4887,6 +4963,7 @@ if user_df is not None:
                                 wp_bartlett_selections=st.session_state.get("wp_bartlett_selections_male", {}),
                                 reed_selections=st.session_state.get("reed_selections_male", {}),
                                 drift_selections=st.session_state.get("drift_selections_male", {}),
+                                mapping_warnings=male_warnings,
                             )
                             male_df_final = res_male.clean_df
                         except Exception as e:
@@ -4903,6 +4980,7 @@ if user_df is not None:
                                 wp_bartlett_selections=st.session_state.get("wp_bartlett_selections_female", {}),
                                 reed_selections=st.session_state.get("reed_selections_female", {}),
                                 drift_selections=st.session_state.get("drift_selections_female", {}),
+                                mapping_warnings=female_warnings,
                             )
                             female_df_final = res_female.clean_df
                         except Exception as e:
