@@ -2133,6 +2133,365 @@ def build_aps_table(cvi_pct: float, cvg_pct: float, k: float = 2.0) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
+# ——————————————————————————————————————————————————————————————
+# Full Report Export Functions (XLSX & PDF)
+# ——————————————————————————————————————————————————————————————
+def _build_full_report_xlsx(
+    groups: dict,  # dict[str, tuple[BVResult, pd.DataFrame]]
+    use_cv_anova_flag: bool,
+    unit: str,
+) -> io.BytesIO:
+    """
+    Build a comprehensive XLSX workbook with multiple sheets:
+    - Summary (key metrics for all groups)
+    - Study Design
+    - Core Estimates
+    - APS (Analytical Performance Specifications)
+    - BIVAC Checklist(s)
+    - Preprocessing Log
+    """
+    import importlib
+    engine = "xlsxwriter" if importlib.util.find_spec("xlsxwriter") else "openpyxl"
+
+    output = io.BytesIO()
+
+    def _fmt_ci(ci) -> str:
+        if ci is None:
+            return ""
+        return f"{ci[0]:.2f}–{ci[1]:.2f}"
+
+    def _pick_cvi(r, use_anova: bool):
+        if use_anova and r.cv_I_cv_anova is not None and r.ci_cv_I_cv_anova is not None:
+            return r.cv_I_cv_anova, r.ci_cv_I_cv_anova, "CV-ANOVA"
+        return r.cv_I, r.ci_cv_I, "Standard ANOVA"
+
+    with pd.ExcelWriter(output, engine=engine) as xl:
+        # ── Summary Sheet ───────────────────────────────────────────
+        summary_rows = []
+        for label, (r, raw_df) in groups.items():
+            cvi_val, cvi_ci, cvi_method = _pick_cvi(r, use_cv_anova_flag)
+            unit_txt = f" {unit}" if unit else ""
+            summary_rows.append({
+                "Group": label,
+                "Subjects (I)": r.I,
+                "Samples/Subject (S)": r.S,
+                "Replicates/Sample (R)": r.R,
+                f"Mean{unit_txt}": f"{r.grand_mean:.2f}",
+                f"Mean CI (95%){unit_txt}": _fmt_ci(r.ci_mean),
+                "CVA (%)": f"{r.cv_A:.2f}",
+                "CVA CI (95%)": _fmt_ci(r.ci_cv_A),
+                f"CVI (%) [{cvi_method}]": f"{cvi_val:.2f}",
+                "CVI CI (95%)": _fmt_ci(cvi_ci),
+                "CVG (%)": f"{r.cv_G:.2f}",
+                "CVG CI (95%)": _fmt_ci(r.ci_cv_G),
+                "RCV (95%)": f"−{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%",
+            })
+        pd.DataFrame(summary_rows).to_excel(xl, sheet_name="Summary", index=False)
+
+        # ── Per-group sheets ────────────────────────────────────────
+        for label, (r, raw_df) in groups.items():
+            safe_label = label[:20]  # Excel sheet name limit
+
+            # Study Design
+            design_rows = [
+                {"Parameter": "Number of subjects (I)", "Value": r.I},
+                {"Parameter": "Samples per subject (S)", "Value": r.S},
+                {"Parameter": "Replicates per sample (R)", "Value": r.R},
+            ]
+            pd.DataFrame(design_rows).to_excel(xl, sheet_name=f"{safe_label}_Design", index=False)
+
+            # Core Estimates
+            cvi_val, cvi_ci, cvi_method = _pick_cvi(r, use_cv_anova_flag)
+            unit_txt = f" {unit}" if unit else ""
+            core_rows = [
+                {"Parameter": f"Mean concentration{unit_txt}", "Value": f"{r.grand_mean:.2f}", "CI (95%)": _fmt_ci(r.ci_mean)},
+                {"Parameter": "Analytical CV (%)", "Value": f"{r.cv_A:.2f}", "CI (95%)": _fmt_ci(r.ci_cv_A)},
+                {"Parameter": "Within-subject CV (standard ANOVA) (%)", "Value": f"{r.cv_I:.2f}", "CI (95%)": _fmt_ci(r.ci_cv_I)},
+            ]
+            if r.cv_I_cv_anova is not None and r.ci_cv_I_cv_anova is not None:
+                core_rows.append({
+                    "Parameter": "Within-subject CV (CV-ANOVA) (%)",
+                    "Value": f"{r.cv_I_cv_anova:.2f}",
+                    "CI (95%)": _fmt_ci(r.ci_cv_I_cv_anova),
+                })
+            core_rows.extend([
+                {"Parameter": "Between-subject CV (%)", "Value": f"{r.cv_G:.2f}", "CI (95%)": _fmt_ci(r.ci_cv_G)},
+                {"Parameter": "RCV 95% (lognormal)", "Value": f"−{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%", "CI (95%)": ""},
+            ])
+            pd.DataFrame(core_rows).to_excel(xl, sheet_name=f"{safe_label}_Estimates", index=False)
+
+            # APS
+            cvi_for_aps = cvi_val
+            aps_df = build_aps_table(cvi_pct=cvi_for_aps, cvg_pct=r.cv_G)
+            aps_df.to_excel(xl, sheet_name=f"{safe_label}_APS", index=False)
+
+            # BIVAC Checklist
+            try:
+                bivac_df = build_bivac_df_for_group(label, r, raw_df)
+                bivac_df.to_excel(xl, sheet_name=f"{safe_label}_BIVAC", index=False)
+            except Exception as e:
+                pd.DataFrame({"Error": [str(e)]}).to_excel(xl, sheet_name=f"{safe_label}_BIVAC", index=False)
+
+            # Preprocessing Log
+            if r.preprocess_log:
+                log_df = pd.DataFrame({"Preprocessing Log": r.preprocess_log})
+                log_df.to_excel(xl, sheet_name=f"{safe_label}_Log", index=False)
+
+    output.seek(0)
+    return output
+
+
+def _build_full_report_pdf(
+    groups: dict,  # dict[str, tuple[BVResult, pd.DataFrame]]
+    use_cv_anova_flag: bool,
+    unit: str,
+    analyte_name: str = "",
+    plots: dict | None = None,  # dict of plot name -> Plotly Figure
+) -> io.BytesIO:
+    """
+    Build a comprehensive PDF report with all key results and plots.
+    Uses reportlab if available, otherwise falls back to a simple text-based PDF.
+
+    plots: dict with keys like 'subject_ranges', 'gender_stratified', 'population_trend'
+           values are Plotly go.Figure objects
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
+        USE_REPORTLAB = True
+    except ImportError:
+        USE_REPORTLAB = False
+
+    output = io.BytesIO()
+
+    def _fmt_ci(ci) -> str:
+        if ci is None:
+            return ""
+        return f"{ci[0]:.2f}–{ci[1]:.2f}"
+
+    def _pick_cvi(r, use_anova: bool):
+        if use_anova and r.cv_I_cv_anova is not None and r.ci_cv_I_cv_anova is not None:
+            return r.cv_I_cv_anova, r.ci_cv_I_cv_anova, "CV-ANOVA"
+        return r.cv_I, r.ci_cv_I, "Standard ANOVA"
+
+    def _plotly_to_image(fig, width=700, height=400) -> io.BytesIO | None:
+        """Convert a Plotly figure to a PNG image BytesIO object."""
+        try:
+            img_bytes = fig.to_image(format="png", width=width, height=height, scale=2)
+            return io.BytesIO(img_bytes)
+        except Exception:
+            # kaleido not installed or other error
+            return None
+
+    if USE_REPORTLAB:
+        doc = SimpleDocTemplate(output, pagesize=A4,
+                                leftMargin=1.5*cm, rightMargin=1.5*cm,
+                                topMargin=1.5*cm, bottomMargin=1.5*cm)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=18, spaceAfter=20, alignment=1)
+        heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], fontSize=14, spaceAfter=10, spaceBefore=15)
+        subheading_style = ParagraphStyle('SubHeading', parent=styles['Heading3'], fontSize=12, spaceAfter=8, spaceBefore=10)
+
+        elements = []
+
+        # Title
+        title = analyte_name if analyte_name else "Biological Variation Report"
+        elements.append(Paragraph(title, title_style))
+        elements.append(Spacer(1, 0.5*cm))
+
+        for label, (r, _raw_df) in groups.items():
+            cvi_val, _cvi_ci, _cvi_method = _pick_cvi(r, use_cv_anova_flag)
+            unit_txt = f" {unit}" if unit else ""
+
+            # Group Header
+            elements.append(Paragraph(f"Group: {label}", heading_style))
+
+            # Study Design Table
+            elements.append(Paragraph("Study Design", subheading_style))
+            design_data = [
+                ["Parameter", "Value"],
+                ["Number of subjects (I)", str(r.I)],
+                ["Samples per subject (S)", str(r.S)],
+                ["Replicates per sample (R)", str(r.R)],
+            ]
+            t = Table(design_data, colWidths=[10*cm, 5*cm])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#d0e7f5')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 0.3*cm))
+
+            # Core Estimates Table
+            elements.append(Paragraph("Core Estimates", subheading_style))
+            core_data = [
+                ["Parameter", "Value", "CI (95%)"],
+                [f"Mean{unit_txt}", f"{r.grand_mean:.2f}", _fmt_ci(r.ci_mean)],
+                ["CVA (%)", f"{r.cv_A:.2f}", _fmt_ci(r.ci_cv_A)],
+                ["CVI - Standard ANOVA (%)", f"{r.cv_I:.2f}", _fmt_ci(r.ci_cv_I)],
+            ]
+            if r.cv_I_cv_anova is not None and r.ci_cv_I_cv_anova is not None:
+                core_data.append(["CVI - CV-ANOVA (%)", f"{r.cv_I_cv_anova:.2f}", _fmt_ci(r.ci_cv_I_cv_anova)])
+            core_data.extend([
+                ["CVG (%)", f"{r.cv_G:.2f}", _fmt_ci(r.ci_cv_G)],
+                ["RCV 95% (lognormal)", f"−{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%", ""],
+            ])
+            t = Table(core_data, colWidths=[8*cm, 4*cm, 4*cm])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#d0e7f5')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 0.3*cm))
+
+            # APS Table
+            elements.append(Paragraph("Analytical Performance Specifications (APS)", subheading_style))
+            aps_df = build_aps_table(cvi_pct=cvi_val, cvg_pct=r.cv_G)
+            aps_data = [["Specification", "CVa (%)", "Bias (%)", "MAU (k=2)"]]
+            for _, row in aps_df.iterrows():
+                aps_data.append([row["Specification"], f"{row['CVa']:.1f}", f"{row['Bias']:.1f}", f"{row['MAU (k=2)']:.1f}"])
+            t = Table(aps_data, colWidths=[4*cm, 4*cm, 4*cm, 4*cm])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#d0e7f5')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 0.5*cm))
+
+        # ── Add Plots Section ──────────────────────────────────────────────
+        if plots:
+            elements.append(PageBreak())
+            elements.append(Paragraph("Visualization", heading_style))
+
+            # Per-subject distribution plot
+            if "subject_ranges" in plots and plots["subject_ranges"] is not None:
+                elements.append(Paragraph("Per-Subject Distribution", subheading_style))
+                img_io = _plotly_to_image(plots["subject_ranges"], width=700, height=400)
+                if img_io:
+                    elements.append(Image(img_io, width=16*cm, height=9*cm))
+                    elements.append(Spacer(1, 0.5*cm))
+
+            # Gender-stratified distribution plot
+            if "gender_stratified" in plots and plots["gender_stratified"] is not None:
+                elements.append(Paragraph("Gender-Stratified Distribution", subheading_style))
+                img_io = _plotly_to_image(plots["gender_stratified"], width=700, height=400)
+                if img_io:
+                    elements.append(Image(img_io, width=16*cm, height=9*cm))
+                    elements.append(Spacer(1, 0.5*cm))
+
+            # Population trend plot
+            if "population_trend" in plots and plots["population_trend"] is not None:
+                elements.append(Paragraph("Population Time Trend", subheading_style))
+                img_io = _plotly_to_image(plots["population_trend"], width=700, height=400)
+                if img_io:
+                    elements.append(Image(img_io, width=16*cm, height=9*cm))
+                    elements.append(Spacer(1, 0.5*cm))
+
+        doc.build(elements)
+    else:
+        # Fallback: simple text-based PDF using basic approach
+        # This creates a minimal PDF without reportlab
+        lines = []
+        lines.append("BIOLOGICAL VARIATION REPORT")
+        lines.append("=" * 50)
+        lines.append("")
+
+        for label, (r, _raw_df) in groups.items():
+            cvi_val, _cvi_ci, _cvi_method = _pick_cvi(r, use_cv_anova_flag)
+            unit_txt = f" {unit}" if unit else ""
+
+            lines.append(f"GROUP: {label}")
+            lines.append("-" * 40)
+            lines.append("")
+            lines.append("Study Design:")
+            lines.append(f"  Subjects (I): {r.I}")
+            lines.append(f"  Samples/Subject (S): {r.S}")
+            lines.append(f"  Replicates/Sample (R): {r.R}")
+            lines.append("")
+            lines.append("Core Estimates:")
+            lines.append(f"  Mean{unit_txt}: {r.grand_mean:.2f} (CI: {_fmt_ci(r.ci_mean)})")
+            lines.append(f"  CVA (%): {r.cv_A:.2f} (CI: {_fmt_ci(r.ci_cv_A)})")
+            lines.append(f"  CVI - Standard ANOVA (%): {r.cv_I:.2f} (CI: {_fmt_ci(r.ci_cv_I)})")
+            if r.cv_I_cv_anova is not None:
+                lines.append(f"  CVI - CV-ANOVA (%): {r.cv_I_cv_anova:.2f} (CI: {_fmt_ci(r.ci_cv_I_cv_anova)})")
+            lines.append(f"  CVG (%): {r.cv_G:.2f} (CI: {_fmt_ci(r.ci_cv_G)})")
+            lines.append(f"  RCV 95%: −{r.rcv_95_down:.2f}% / +{r.rcv_95_up:.2f}%")
+            lines.append("")
+            lines.append("APS (Analytical Performance Specifications):")
+            aps_df = build_aps_table(cvi_pct=cvi_val, cvg_pct=r.cv_G)
+            for _, row in aps_df.iterrows():
+                lines.append(f"  {row['Specification']}: CVa={row['CVa']:.1f}%, Bias={row['Bias']:.1f}%, MAU={row['MAU (k=2)']:.1f}")
+            lines.append("")
+            lines.append("=" * 50)
+            lines.append("")
+
+        # Create simple PDF
+        content = "\n".join(lines)
+        # Minimal PDF structure
+        pdf_content = f"""%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length {len(content) + 100} >>
+stream
+BT
+/F1 10 Tf
+50 750 Td
+12 TL
+"""
+        for line in lines:
+            safe_line = line.replace("(", "\\(").replace(")", "\\)").replace("−", "-")
+            pdf_content += f"({safe_line}) '\n"
+
+        pdf_content += """ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 6
+0000000000 65535 f
+0000000009 00000 n
+0000000058 00000 n
+0000000115 00000 n
+0000000266 00000 n
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+%%EOF
+"""
+        output.write(pdf_content.encode('latin-1', errors='replace'))
+
+    output.seek(0)
+    return output
+
+
 # ——— helper for the unbalanced branch ——————————————————————————————
 def _calculate_bv_unbalanced(df: pd.DataFrame,
                              alpha: float = 0.05) -> dict[str, float]:
@@ -5567,6 +5926,82 @@ if user_df is not None:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key="dl_bivac_allgroups",
                     )
+
+                # ─────────────────────────────────────────────────────────────
+                #  📥 FULL REPORT DOWNLOAD (XLSX & PDF)
+                # ─────────────────────────────────────────────────────────────
+                st.divider()
+                st.subheader("Download Full Report")
+                st.caption("Download a comprehensive report including all results, APS, and BIVAC checklist.")
+
+                report_col1, report_col2 = st.columns(2)
+
+                with report_col1:
+                    # XLSX Report
+                    try:
+                        xlsx_report = _build_full_report_xlsx(
+                            groups=groups,
+                            use_cv_anova_flag=use_cv_anova_flag,
+                            unit=unit,
+                        )
+                        analyte_name = st.session_state.get("analyte_name", "BV_Report")
+                        safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in analyte_name) or "BV_Report"
+                        st.download_button(
+                            label="⬇️ Download Full Report (XLSX)",
+                            data=xlsx_report.getvalue(),
+                            file_name=f"{safe_name}_Full_Report.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_full_report_xlsx",
+                        )
+                    except Exception as e:
+                        st.error(f"Could not generate XLSX report: {e}")
+
+                with report_col2:
+                    # PDF Report
+                    try:
+                        analyte_name = st.session_state.get("analyte_name", "")
+
+                        # Build plots dictionary for PDF
+                        pdf_plots = {}
+
+                        # Per-subject distribution plot (always available)
+                        if final_df is not None and not final_df.empty:
+                            pdf_plots["subject_ranges"] = plot_subject_ranges(final_df)
+
+                        # Gender-stratified plot (if gender-based calculations)
+                        if st.session_state.get("gender_based", False) and "df_gender" in locals() and "Gender" in df_gender.columns:
+                            gender_map_pdf = df_gender.set_index("Subject")["Gender"].to_dict()
+                            pdf_plots["gender_stratified"] = plot_gender_stratified_ranges(final_df, gender_map_pdf)
+
+                        # Population trend plot (if enabled)
+                        if st.session_state["preproc_flags"].get("pop_drift", False):
+                            try:
+                                prebal_df_pdf, _ = _preprocess_bv_dataframe(
+                                    df_for_calc,
+                                    flags=st.session_state["preproc_flags"],
+                                    enforce_balance=False
+                                )
+                                pdf_plots["population_trend"] = plot_population_trend(prebal_df_pdf)
+                            except Exception:
+                                pass  # Skip if population trend cannot be generated
+
+                        pdf_report = _build_full_report_pdf(
+                            groups=groups,
+                            use_cv_anova_flag=use_cv_anova_flag,
+                            unit=unit,
+                            analyte_name=analyte_name,
+                            plots=pdf_plots,
+                        )
+                        safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in analyte_name) or "BV_Report"
+                        st.download_button(
+                            label="⬇️ Download Full Report (PDF)",
+                            data=pdf_report.getvalue(),
+                            file_name=f"{safe_name}_Full_Report.pdf",
+                            mime="application/pdf",
+                            key="dl_full_report_pdf",
+                        )
+                    except Exception as e:
+                        st.error(f"Could not generate PDF report: {e}")
 
 
             except PreprocessError as e:
