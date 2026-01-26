@@ -1296,11 +1296,18 @@ def _preprocess_bv_dataframe(
         reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
         drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
         mapping_warnings: list[str] | None = None,   # warnings from data mapping (e.g., dropped rows)
+        use_cv_anova_normalization: bool = False,    # normalize data for outlier detection (CV-ANOVA mode)
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
     filters required by Braga-Panteghini.  Returns a cleaned DataFrame **plus**
     a detailed chronological log (list of strings).
+
+    When use_cv_anova_normalization=True:
+    - Data is normalized (Result / subject_mean) for outlier detection
+    - After outlier exclusion, data is de-normalized back to original scale
+    - This ensures outliers are identified on normalized scale but final
+      calculations use raw concentration values
     """
     log: list[str] = []
 
@@ -1310,6 +1317,15 @@ def _preprocess_bv_dataframe(
             log.append(f"Data mapping: {warn}")
     df = df_in.copy()
     transformed = False
+
+    # ── CV-ANOVA normalization for outlier detection ──────────────────────────
+    subject_means_dict = None
+    if use_cv_anova_normalization:
+        # Store original subject means as dict {Subject: mean} for de-normalization later
+        subject_means_dict = df.groupby("Subject")["Result"].mean().to_dict()
+        # Normalize: divide each Result by subject mean
+        df["Result"] = df["Result"] / df["Subject"].map(subject_means_dict)
+        log.append("CV-ANOVA mode: Data normalized (Result / subject mean) for outlier detection.")
 
     flags = flags or {}                    # safety – empty dict if None
     ON     = lambda name: flags.get(name, True)   # helper: is this step enabled?
@@ -1897,6 +1913,13 @@ def _preprocess_bv_dataframe(
     # ════════════════════════════════════════════════════════════════════════
     if transformed:
         df["Result"] = np.exp(df["Result"])
+
+    # ── CV-ANOVA de-normalization: restore original scale ──────────────────
+    if use_cv_anova_normalization and subject_means_dict is not None:
+        # Multiply back by original subject means to restore raw concentration scale
+        # Note: Some subjects may have been removed, so we use map with the stored dict
+        df["Result"] = df["Result"] * df["Subject"].map(subject_means_dict)
+        log.append("CV-ANOVA mode: Data de-normalized (restored to original concentration scale) for variance calculations.")
 
     return df, log
 
@@ -2633,6 +2656,7 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             reed_selections=reed_selections,
             drift_selections=drift_selections,
             mapping_warnings=mapping_warnings or [],
+            use_cv_anova_normalization=use_cv_anova,  # normalize for outlier detection when CV-ANOVA selected
         )
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
@@ -3287,12 +3311,32 @@ with st.sidebar:
     
     # Further Analysis Section
     st.sidebar.subheader("Further Analysis")
-    ANALYSIS_OPTS = {
-        "Normality checks / log-transform (QI 9)" : ("normality", True),
-        "Population drift (QI 7)"                 : ("pop_drift", False),
-    }
-    for label, (key, default) in ANALYSIS_OPTS.items():
-        preproc_flags[key] = st.sidebar.checkbox(label, value=default)
+
+    # CV-ANOVA option (moved here to control normality auto-selection)
+    estimate_cv_anova = st.sidebar.checkbox(
+        "Estimate CVI with CV-ANOVA",
+        help="When enabled, data will be normalized (divided by subject mean) BEFORE outlier detection, and normality checks will be auto-enabled."
+    )
+    st.session_state["use_cv_anova"] = estimate_cv_anova
+
+    # Normality checkbox - auto-enabled and disabled when CV-ANOVA is selected
+    if estimate_cv_anova:
+        # Force normality ON when CV-ANOVA is selected
+        st.sidebar.checkbox(
+            "Normality checks / log-transform (QI 9)",
+            value=True,
+            disabled=True,
+            help="Auto-enabled because CV-ANOVA is selected (normalization is required)."
+        )
+        preproc_flags["normality"] = True
+    else:
+        preproc_flags["normality"] = st.sidebar.checkbox(
+            "Normality checks / log-transform (QI 9)",
+            value=True
+        )
+
+    # Population drift checkbox
+    preproc_flags["pop_drift"] = st.sidebar.checkbox("Population drift (QI 7)", value=False)
     
     # Implicitly enable exclusion logic if the parent check is ON
     preproc_flags["rep_bartlett_exclusion"] = preproc_flags.get("rep_bartlett", False)
@@ -3603,19 +3647,26 @@ if user_df is not None:
         st.info("**When using BIVAC, please cite the following reference:** *Aarsand AK, Røraas T, Fernandez-Calle P, Ricos C, Díaz-Garzón J, Jonker N, Perich C, González-Lao E, Carobene A, Minchinela J, Coşkun A, Simón M, Álvarez V, Bartlett WA, Fernández-Fernández P, Boned B, Braga F, Corte Z, Aslan B, Sandberg S; European Federation of Clinical Chemistry and Laboratory Medicine Working Group on Biological Variation and Task and Finish Group for the Biological Variation Database. The Biological Variation Data Critical Appraisal Checklist: A Standard for Evaluating Studies on Biological Variation. Clin Chem. 2018 Mar;64(3):501-514. doi: 10.1373/clinchem.2017.281808. Epub 2017 Dec 8. PMID: 29222339.*")
 
 
-    # NEW – user option: CV-ANOVA
-    estimate_cv_anova = st.checkbox("Estimate CVI with CV-ANOVA")
-    st.session_state["use_cv_anova"] = estimate_cv_anova
-
     # ─────────────────────────────────────────────────────────────
     # Replicate-level outlier detection and user selection UI
     # ─────────────────────────────────────────────────────────────
     # Define mapped_df at this scope so ALL outlier UI sections can access it
     mapped_df = st.session_state.get("mapped_df")
-    
+
+    # ── CV-ANOVA normalization: normalize data BEFORE outlier detection ──
+    use_cv_anova_for_outliers = st.session_state.get("use_cv_anova", False)
+    if use_cv_anova_for_outliers and mapped_df is not None and not mapped_df.empty:
+        # Normalize: divide each Result by subject mean
+        mapped_df = mapped_df.copy()
+        mapped_df["Result"] = mapped_df["Result"] / mapped_df.groupby("Subject")["Result"].transform("mean")
+        st.session_state["mapped_df_normalized"] = mapped_df
+        st.info("📊 **CV-ANOVA mode**: Data has been normalized (each result divided by subject mean) for outlier detection.")
+    elif mapped_df is not None:
+        st.session_state["mapped_df_normalized"] = None
+
     if st.session_state.get("mapping_ok", False) and st.session_state.get("preproc_flags", {}).get("rep_cochran", True) and mapped_df is not None:
         if mapped_df is not None and not mapped_df.empty:
-            # Detect replicate-level outliers
+            # Detect replicate-level outliers (on normalized data if CV-ANOVA is selected)
             detected_outliers = _detect_replicate_outliers(mapped_df.copy())
             
             # Initialize selection storage if not present
@@ -5815,7 +5866,8 @@ if user_df is not None:
                     prebal_df, _ = _preprocess_bv_dataframe(
                         df_for_calc,
                         flags=st.session_state["preproc_flags"],
-                        enforce_balance=False
+                        enforce_balance=False,
+                        use_cv_anova_normalization=st.session_state.get("use_cv_anova", False),
                     )
 
                     st.subheader("Population time trend (pre-balance)")
@@ -5979,7 +6031,8 @@ if user_df is not None:
                                 prebal_df_pdf, _ = _preprocess_bv_dataframe(
                                     df_for_calc,
                                     flags=st.session_state["preproc_flags"],
-                                    enforce_balance=False
+                                    enforce_balance=False,
+                                    use_cv_anova_normalization=st.session_state.get("use_cv_anova", False),
                                 )
                                 pdf_plots["population_trend"] = plot_population_trend(prebal_df_pdf)
                             except Exception:
