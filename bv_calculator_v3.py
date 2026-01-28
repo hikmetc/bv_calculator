@@ -1297,6 +1297,8 @@ def _preprocess_bv_dataframe(
         drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
         mapping_warnings: list[str] | None = None,   # warnings from data mapping (e.g., dropped rows)
         use_cv_anova_normalization: bool = False,    # normalize data for outlier detection (CV-ANOVA mode)
+        store_exclusion_summary: bool = True,        # store exclusion summary in session_state
+        exclusion_summary_key: str = "exclusion_summary",  # key for storing exclusion summary (e.g., "exclusion_summary_male")
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Apply all pre-analysis quality-improvement (QI) checks and statistical
@@ -1329,6 +1331,12 @@ def _preprocess_bv_dataframe(
 
     flags = flags or {}                    # safety – empty dict if None
     ON     = lambda name: flags.get(name, True)   # helper: is this step enabled?
+
+    # ── Track initial counts for exclusion summary ────────────────────────────
+    initial_n_rows = len(df)
+    initial_n_subjects = df["Subject"].nunique()
+    initial_n_samples = df.groupby("Subject")["Sample"].nunique().sum()  # total unique samples across all subjects
+    initial_n_replicates = initial_n_rows  # each row is a replicate measurement
 
     # ════════════════════════════════════════════════════════════════════════
     # 0.  Replicate‑set consistency  (QI 8a – Cochran variance test)
@@ -1714,21 +1722,29 @@ def _preprocess_bv_dataframe(
     if ON("drift"):
         # 1. Apply user selections (if any)
         if drift_selections:
+            # Get drift stats for all subjects before applying selections
+            drift_stats = {out["Subject"]: out for out in _detect_drift_outliers(df)}
             for subj, action in drift_selections.items():
+                stats_txt = ""
+                if subj in drift_stats:
+                    out = drift_stats[subj]
+                    ci_lo, ci_hi = out["ci"]
+                    stats_txt = f" slope={out['slope']:.4g} (95% CI {ci_lo:.4g} to {ci_hi:.4g}, p={out['p']:.4g})"
                 if action == "remove":
-                    log.append(f"QI 7 – Drift outlier removed (user selection) → Subject {subj}")
+                    log.append(f"QI 7 – Drift outlier removed (user selection) → Subject {subj}{stats_txt}")
                     df = df[df["Subject"] != subj]
                 elif action == "ignore":
-                    log.append(f"QI 7 – Drift outlier ignored (user selection) → Subject {subj}")
+                    log.append(f"QI 7 – Drift outlier ignored (user selection) → Subject {subj}{stats_txt}")
 
         # 2. Auto Mode
         if flags.get("outlier_mode") != "manual":
             auto_drift = _detect_drift_outliers(df)
             for out in auto_drift:
                 subj = out["Subject"]
+                ci_lo, ci_hi = out["ci"]
                 log.append(
                     f"QI 7 – temporal drift removed (auto): Subject {subj} "
-                    f"slope={out['slope']:.3g} (p={out['p']:.3g})"
+                    f"slope={out['slope']:.4g} (95% CI {ci_lo:.4g} to {ci_hi:.4g}, p={out['p']:.4g})"
                 )
                 df = df[df["Subject"] != subj]
 
@@ -1737,7 +1753,12 @@ def _preprocess_bv_dataframe(
         if not final_drifts:
             log.append("QI 7 – Steady-state drift test passed: no trend outliers.")
         else:
-            log.append(f"QI 7 – Drift outliers identified (retained/ignored): {len(final_drifts)} subjects.")
+            for out in final_drifts:
+                ci_lo, ci_hi = out["ci"]
+                log.append(
+                    f"QI 7 – Drift outlier identified (retained/ignored): Subject {out['Subject']} "
+                    f"slope={out['slope']:.4g} (95% CI {ci_lo:.4g} to {ci_hi:.4g}, p={out['p']:.4g})"
+                )
             
     else:
         log.append("Steady‑state drift (QI 7) skipped (switch off).")
@@ -1920,6 +1941,37 @@ def _preprocess_bv_dataframe(
         # Note: Some subjects may have been removed, so we use map with the stored dict
         df["Result"] = df["Result"] * df["Subject"].map(subject_means_dict)
         log.append("CV-ANOVA mode: Data de-normalized (restored to original concentration scale) for variance calculations.")
+
+    # ── Calculate and log exclusion summary ───────────────────────────────────
+    final_n_rows = len(df)
+    final_n_subjects = df["Subject"].nunique()
+    final_n_samples = df.groupby("Subject")["Sample"].nunique().sum()
+    final_n_replicates = final_n_rows
+
+    excluded_subjects = initial_n_subjects - final_n_subjects
+    excluded_samples = initial_n_samples - final_n_samples
+    excluded_replicates = initial_n_replicates - final_n_replicates
+
+    log.append(
+        f"─── Exclusion Summary ───\n"
+        f"  Subjects: {excluded_subjects} excluded (from {initial_n_subjects} to {final_n_subjects})\n"
+        f"  Samples: {excluded_samples} excluded (from {initial_n_samples} to {final_n_samples})\n"
+        f"  Replicates (rows): {excluded_replicates} excluded (from {initial_n_replicates} to {final_n_replicates})"
+    )
+
+    # Store exclusion counts in session state for use in study design table
+    if store_exclusion_summary:
+        st.session_state[exclusion_summary_key] = {
+            "initial_subjects": initial_n_subjects,
+            "final_subjects": final_n_subjects,
+            "excluded_subjects": excluded_subjects,
+            "initial_samples": initial_n_samples,
+            "final_samples": final_n_samples,
+            "excluded_samples": excluded_samples,
+            "initial_replicates": initial_n_replicates,
+            "final_replicates": final_n_replicates,
+            "excluded_replicates": excluded_replicates,
+        }
 
     return df, log
 
@@ -2221,6 +2273,22 @@ def _build_full_report_xlsx(
                 {"Parameter": "Samples per subject (S)", "Value": r.S},
                 {"Parameter": "Replicates per sample (R)", "Value": r.R},
             ]
+            # Add exclusion summary if available - use appropriate key based on label
+            try:
+                if label == "Male":
+                    excl_key = "exclusion_summary_male"
+                elif label == "Female":
+                    excl_key = "exclusion_summary_female"
+                else:
+                    excl_key = "exclusion_summary"
+                excl = st.session_state.get(excl_key)
+                if excl:
+                    design_rows.append({"Parameter": "--- Exclusions ---", "Value": ""})
+                    design_rows.append({"Parameter": "Subjects excluded", "Value": f"{excl['excluded_subjects']} (from {excl['initial_subjects']} to {excl['final_subjects']})"})
+                    design_rows.append({"Parameter": "Samples excluded", "Value": f"{excl['excluded_samples']} (from {excl['initial_samples']} to {excl['final_samples']})"})
+                    design_rows.append({"Parameter": "Replicates excluded", "Value": f"{excl['excluded_replicates']} (from {excl['initial_replicates']} to {excl['final_replicates']})"})
+            except Exception:
+                pass
             pd.DataFrame(design_rows).to_excel(xl, sheet_name=f"{safe_label}_Design", index=False)
 
             # Core Estimates
@@ -2340,6 +2408,22 @@ def _build_full_report_pdf(
                 ["Samples per subject (S)", str(r.S)],
                 ["Replicates per sample (R)", str(r.R)],
             ]
+            # Add exclusion summary if available - use appropriate key based on label
+            try:
+                if label == "Male":
+                    excl_key = "exclusion_summary_male"
+                elif label == "Female":
+                    excl_key = "exclusion_summary_female"
+                else:
+                    excl_key = "exclusion_summary"
+                excl = st.session_state.get(excl_key)
+                if excl:
+                    design_data.append(["--- Exclusions ---", ""])
+                    design_data.append(["Subjects excluded", f"{excl['excluded_subjects']} (from {excl['initial_subjects']} to {excl['final_subjects']})"])
+                    design_data.append(["Samples excluded", f"{excl['excluded_samples']} (from {excl['initial_samples']} to {excl['final_samples']})"])
+                    design_data.append(["Replicates excluded", f"{excl['excluded_replicates']} (from {excl['initial_replicates']} to {excl['final_replicates']})"])
+            except Exception:
+                pass  # Skip if session_state not available
             t = Table(design_data, colWidths=[10*cm, 5*cm])
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#d0e7f5')),
@@ -2599,6 +2683,8 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
                  reed_selections: dict | None = None,         # user selections for Reed outliers (QI 8c)
                  drift_selections: dict | None = None,        # user selections for Steady-state drift (QI 7)
                  mapping_warnings: list[str] | None = None,   # warnings from data mapping (e.g., dropped rows)
+                 store_exclusion_summary: bool = True,        # store exclusion summary in session_state
+                 exclusion_summary_key: str = "exclusion_summary",  # key for storing exclusion summary
 ) -> BVResult:
     """Compute balanced‑design variance components & CVs.
 
@@ -2657,6 +2743,8 @@ def calculate_bv(df: pd.DataFrame, alpha: float = 0.05,
             drift_selections=drift_selections,
             mapping_warnings=mapping_warnings or [],
             use_cv_anova_normalization=use_cv_anova,  # normalize for outlier detection when CV-ANOVA selected
+            store_exclusion_summary=store_exclusion_summary,
+            exclusion_summary_key=exclusion_summary_key,
         )
     except PreprocessError as e:
         # Propagate the cleaner’s detailed log upward
@@ -5374,6 +5462,8 @@ if user_df is not None:
                                 reed_selections=st.session_state.get("reed_selections_male", {}),
                                 drift_selections=st.session_state.get("drift_selections_male", {}),
                                 mapping_warnings=male_warnings,
+                                store_exclusion_summary=True,
+                                exclusion_summary_key="exclusion_summary_male",
                             )
                             male_df_final = res_male.clean_df
                         except Exception as e:
@@ -5391,6 +5481,8 @@ if user_df is not None:
                                 reed_selections=st.session_state.get("reed_selections_female", {}),
                                 drift_selections=st.session_state.get("drift_selections_female", {}),
                                 mapping_warnings=female_warnings,
+                                store_exclusion_summary=True,
+                                exclusion_summary_key="exclusion_summary_female",
                             )
                             female_df_final = res_female.clean_df
                         except Exception as e:
@@ -5531,7 +5623,7 @@ if user_df is not None:
                         return "CVI (CV-ANOVA) (%)", float(r.cv_I_cv_anova), tuple(r.ci_cv_I_cv_anova)
                     return "CVI (standard ANOVA) (%)", float(r.cv_I), tuple(r.ci_cv_I)
 
-                def _build_study_design_table(r: BVResult) -> pd.DataFrame:
+                def _build_study_design_table(r: BVResult, label: str = "Overall") -> pd.DataFrame:
                     # If unbalanced, S/R may be mean values (floats). Label accordingly.
                     try:
                         s_is_int = float(r.S).is_integer()
@@ -5547,6 +5639,31 @@ if user_df is not None:
                         {"Parameter": s_label,                 "Value": _fmt_count(r.S)},
                         {"Parameter": r_label,                 "Value": _fmt_count(r.R)},
                     ]
+
+                    # Add exclusion summary if available - use appropriate key based on label
+                    if label == "Male":
+                        excl_key = "exclusion_summary_male"
+                    elif label == "Female":
+                        excl_key = "exclusion_summary_female"
+                    else:
+                        excl_key = "exclusion_summary"
+
+                    excl = st.session_state.get(excl_key)
+                    if excl:
+                        rows.append({"Parameter": "─── Exclusions ───", "Value": ""})
+                        rows.append({
+                            "Parameter": "Subjects excluded",
+                            "Value": f"{excl['excluded_subjects']} (from {excl['initial_subjects']} to {excl['final_subjects']})"
+                        })
+                        rows.append({
+                            "Parameter": "Samples excluded",
+                            "Value": f"{excl['excluded_samples']} (from {excl['initial_samples']} to {excl['final_samples']})"
+                        })
+                        rows.append({
+                            "Parameter": "Replicates (rows) excluded",
+                            "Value": f"{excl['excluded_replicates']} (from {excl['initial_replicates']} to {excl['final_replicates']})"
+                        })
+
                     return pd.DataFrame(rows)
 
                 def _build_core_estimates_table(r: BVResult, unit: str, use_cv_anova_flag: bool) -> pd.DataFrame:
@@ -5608,7 +5725,7 @@ if user_df is not None:
                     st.markdown(f"### {label}")
 
                     # Build the two tables
-                    design_df = _build_study_design_table(r)
+                    design_df = _build_study_design_table(r, label)
                     core_df   = _build_core_estimates_table(r, unit, use_cv_anova_flag)
 
                     # Common style (matches your current header theme)
