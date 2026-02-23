@@ -4408,7 +4408,7 @@ if user_df is not None:
     # ─────────────────────────────────────────────────────────────
     # Gender-based calculations UI
     # ─────────────────────────────────────────────────────────────
-    gender_based = st.checkbox("Gender based calculations", value=False)
+    gender_based = st.checkbox("Subgroup (sex/gender) based calculations", value=False)
     st.session_state["gender_based"] = gender_based
 
     gender_settings_ok = True
