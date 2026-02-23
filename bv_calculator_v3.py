@@ -3320,22 +3320,22 @@ def _render_gender_overlap_recommendations(res_m: BVResult, res_f: BVResult, use
     if not ci_overlaps(cvi_ci_m, cvi_ci_f):
         st.warning(
             "✅ **Gender-based recommendation (CVI):** CVI 95% CIs **do NOT overlap** between genders. "
-            "**Report CVI separately** for Male and Female."
+            "**This may indicate that using different CVIs for Male and Female may be more appropriate.**"
         )
     else:
         st.info(
-            "CVI 95% CIs **overlap** between genders → separate CVI reporting is not required."
+            "CVI 95% CIs **overlap** between genders → separate CVI reporting for the subgroups may not be required."
         )
 
     # Mean overlap check (drives CVG recommendation per your requirement)
     if not ci_overlaps(res_m.ci_mean, res_f.ci_mean):
         st.warning(
             "✅ **Gender-based recommendation (CVG):** Mean concentration 95% CIs **do NOT overlap** between genders. "
-            "**Report CVG separately** for Male and Female."
+            "**This may indicate that subgroup (Male and Female) CVG estimates may be more appropriate for use.**"
         )
     else:
         st.info(
-            "Mean concentration 95% CIs **overlap** between genders → separate CVG reporting is not required."
+            "Mean concentration 95% CIs **overlap** between genders → separate CVG reporting may not be required."
         )
 
 
