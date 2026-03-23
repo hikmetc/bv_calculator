@@ -799,7 +799,7 @@ def _build_qi_checklist(
         overall = worst(overall, grade[q])
         rows.append(dict(
             QI=f"QI {q}",
-            Grade=grade[q],
+            Score=grade[q],
             Comment=comment[q],
             Details=" ⏵ ".join(details[q]) if details[q] else ""
         ))
@@ -2496,7 +2496,7 @@ def _build_full_report_pdf(
                     elements.append(Image(img_io, width=16*cm, height=9*cm))
                     elements.append(Spacer(1, 0.5*cm))
 
-            # Gender-stratified distribution plot
+            # Subgroup-stratified distribution plot
             if "gender_stratified" in plots and plots["gender_stratified"] is not None:
                 elements.append(Paragraph("Gender-Stratified Distribution", subheading_style))
                 img_io = _plotly_to_image(plots["gender_stratified"], width=700, height=400)
@@ -3156,7 +3156,7 @@ def plot_gender_stratified_ranges(clean_df: pd.DataFrame, gender_map: dict[str, 
     y_title = f"{measurand}" + (f" ({unit})" if unit else "")
 
     fig.update_layout(
-        title="Gender-stratified Per-subject Distribution",
+        title="Subgroup-stratified Per-subject Distribution",
         template="simple_white",
         yaxis_title=y_title,
         xaxis_title="",
@@ -3319,23 +3319,23 @@ def _render_gender_overlap_recommendations(res_m: BVResult, res_f: BVResult, use
 
     if not ci_overlaps(cvi_ci_m, cvi_ci_f):
         st.warning(
-            "✅ **Gender-based recommendation (CVI):** CVI 95% CIs **do NOT overlap** between genders. "
+            "✅ **Subgroup-based recommendation (CVI):** CVI 95% CIs **do NOT overlap** between subgroups. "
             "**This may indicate that using different CVIs for Male and Female may be more appropriate.**"
         )
     else:
         st.info(
-            "CVI 95% CIs **overlap** between genders → separate CVI reporting for the subgroups may not be required."
+            "CVI 95% CIs **overlap** between subgroups → separate CVI reporting for the subgroups may not be required."
         )
 
     # Mean overlap check (drives CVG recommendation per your requirement)
     if not ci_overlaps(res_m.ci_mean, res_f.ci_mean):
         st.warning(
-            "✅ **Gender-based recommendation (CVG):** Mean concentration 95% CIs **do NOT overlap** between genders. "
+            "✅ **Subgroup-based recommendation (CVG):** Mean concentration 95% CIs **do NOT overlap** between subgroups. "
             "**This may indicate that subgroup (Male and Female) CVG estimates may be more appropriate for use.**"
         )
     else:
         st.info(
-            "Mean concentration 95% CIs **overlap** between genders → separate CVG reporting may not be required."
+            "Mean concentration 95% CIs **overlap** between subgroups → separate CVG reporting may not be required."
         )
 
 
@@ -4413,18 +4413,18 @@ if user_df is not None:
 
     gender_settings_ok = True
     if gender_based:
-        st.markdown("### Gender mapping")
+        st.markdown("### Subgroup mapping")
 
         cols_all = list(user_df.columns)  # raw dataset columns
 
         gender_mode = st.radio(
-            "How is gender encoded in your dataset?",
-            ["Single gender column", "Two indicator columns (Male/Female)"],
+            "How is subgroup encoded in your dataset?",
+            ["Single subgroup column", "Two indicator columns (Male/Female)"],
             horizontal=True
         )
         st.session_state["gender_mode"] = gender_mode
 
-        if gender_mode == "Single gender column":
+        if gender_mode == "Single subgroup column":
             gender_col = st.selectbox("Gender column", cols_all, index=0)
             # Pull unique values for easy mapping
             uniq = pd.Series(user_df[gender_col]).dropna().unique().tolist()
@@ -4492,9 +4492,9 @@ if user_df is not None:
         if mapped_df is not None and not mapped_df.empty:
             # Build gender-split datasets
             df_with_gender = mapped_df.copy()
-            mode = st.session_state.get("gender_mode", "Single gender column")
+            mode = st.session_state.get("gender_mode", "Single subgroup column")
 
-            if mode == "Single gender column":
+            if mode == "Single subgroup column":
                 gcol = st.session_state.get("gender_col")
                 mv = st.session_state.get("male_value")
                 fv = st.session_state.get("female_value")
@@ -5371,8 +5371,8 @@ if user_df is not None:
                 if gender_based:
                     df_gender = df_for_calc.copy()
 
-                    mode = st.session_state.get("gender_mode", "Single gender column")
-                    if mode == "Single gender column":
+                    mode = st.session_state.get("gender_mode", "Single subgroup column")
+                    if mode == "Single subgroup column":
                         gcol = st.session_state["gender_col"]
                         mv = st.session_state["male_value"]
                         fv = st.session_state["female_value"]
@@ -5411,14 +5411,14 @@ if user_df is not None:
                         female_warnings = []
                         if dropped_indices:
                             # Determine gender for each dropped row from original user_df
-                            mode = st.session_state.get("gender_mode", "Single gender column")
+                            mode = st.session_state.get("gender_mode", "Single subgroup column")
                             n_male_dropped = 0
                             n_female_dropped = 0
                             n_unknown_dropped = 0
 
                             for idx in dropped_indices:
                                 if idx in user_df.index:
-                                    if mode == "Single gender column":
+                                    if mode == "Single subgroup column":
                                         gcol = st.session_state.get("gender_col")
                                         mv = st.session_state.get("male_value")
                                         fv = st.session_state.get("female_value")
@@ -5525,7 +5525,7 @@ if user_df is not None:
                             cvi_cva_txt = "—"  # or "Not computed"
 
                         return {
-                            "Gender": label,
+                            "Subgroup": label,
                             "Mean concentration (95% CI)": f"{r.grand_mean:.2f}" + (f" {unit} " if unit else "") + f"({r.ci_mean[0]:.2f}–{r.ci_mean[1]:.2f})" + (f" {unit}" if unit else ""),
                             #"Mean CI (95%)": f"{r.ci_mean[0]:.2f}–{r.ci_mean[1]:.2f}" + (f" {unit}" if unit else ""),
                             "CVA % (95% CI)": f"{r.cv_A:.2f} ({r.ci_cv_A[0]:.2f}–{r.ci_cv_A[1]:.2f})",
@@ -5542,7 +5542,7 @@ if user_df is not None:
 
                     # ✅ NOW show recommendations AFTER the tables/plots
                     st.divider()
-                    st.subheader("Gender-based reporting recommendations")
+                    st.subheader("Subgroup-based reporting recommendations")
 
                     # Optional plots per gender (only if we successfully built final cleaned dfs)
                     tabs = st.tabs(["Male plot", "Female plot"])
@@ -5592,7 +5592,7 @@ if user_df is not None:
 
                     st.markdown(gender_html, unsafe_allow_html=True)
 
-                    with st.expander("Gender-based reporting recommendations", expanded=True):
+                    with st.expander("Subgroup-based reporting recommendations", expanded=True):
                         _render_gender_overlap_recommendations(res_male, res_female, use_cv_anova_flag)
                     st.divider()
 
@@ -5970,7 +5970,7 @@ if user_df is not None:
                 st.plotly_chart(plot_subject_ranges(final_df), use_container_width=True)
 
                 if st.session_state.get("gender_based", False) and "df_gender" in locals() and "Gender" in df_gender.columns:
-                     st.subheader("Gender-stratified distribution")
+                     st.subheader("Subgroup-stratified distribution")
                      # Re-map gender to the final cleaned dataframe using the calculation-time gender df
                      gender_map = df_gender.set_index("Subject")["Gender"].to_dict()
                      st.plotly_chart(plot_gender_stratified_ranges(final_df, gender_map), use_container_width=True)
@@ -6042,7 +6042,7 @@ if user_df is not None:
                         bivac_df.style
                             .apply(
                                 lambda s: ["background:#e8f9f0" if g in ("A", "B") else "background:#fdecea" for g in s],
-                                axis=1, subset=["Grade"]
+                                axis=1, subset=["Score"]
                             )
                             .apply(_style_details_series, subset=["Details"])
                             .set_properties(**{"font-size": "0.85rem"}),
@@ -6188,4 +6188,4 @@ if user_df is not None:
             st.error(f"Calculation failed: {e}")
 else:
     st.info("Input data above to enable calculation.")
-
+    
