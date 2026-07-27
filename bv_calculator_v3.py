@@ -3348,6 +3348,7 @@ st.title("Biological Variation Calculator")
 
 # 6.2  sidebar – quick help & template downloads
 with st.sidebar:
+    st.image('./images/eflm_logo.png')
     st.header("Quick start")
     st.write(
         "1. Upload or paste your balanced study file (CSV/XLSX)\n"
